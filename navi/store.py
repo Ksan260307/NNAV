@@ -131,6 +131,7 @@ def save_snapshot(brain, growth, mood, extra: Dict[str, Any], path: str) -> None
         "id2word": brain.id2word,
         "pos": brain.pos,
         "pos1": brain.pos1,
+        "conj": brain.conj,
         "content": bytes(brain._content[:n]),
         "state": brain.state[:n].cpu(),
         "valence": brain.valence[:n].cpu(),
@@ -178,6 +179,7 @@ def load_snapshot(brain, growth, mood, path: str) -> Dict[str, Any]:
     brain.id2word = list(data["id2word"])
     brain.pos = list(data["pos"])
     brain.pos1 = list(data["pos1"])
+    brain.conj = list(data.get("conj") or [""] * len(brain.pos))
     brain.word2id = {w: i for i, w in enumerate(brain.id2word)}
     n = len(brain.id2word)
     brain._grow(n + 1)

@@ -68,6 +68,22 @@ class Config:
     frame_weight: float = 0.9         # 選択選好の採点重み
     semantic_weight: float = 1.3      # 意味ベクトルによる話題一致の重み
     fact_answer_bias: float = 2.6     # 知っている事実で答えるときの下駄
+    use_person_words: bool = True     # 人称を役割(@OP/@NAVI)に畳むか
+    bootstrap_function_words: bool = True   # 疑問詞・人称・指示詞の種を与えるか
+    discover_function_words: bool = True    # 機能語を分布から自力で見つけるか
+    use_demonstratives: bool = True   # 指示詞(それ/あれ)を解決するか
+    plan_bias: float = 0.0            # 組み立て生成への下駄(0 = 実力勝負)
+    plan_candidates: int = 3
+    intents_enabled: bool = True
+    intent_k: int = 6
+    intent_weight: float = 1.1        # 返答の意図が噛み合うことへの加点
+    senses_enabled: bool = True       # 接地(時刻・環境との結び付き)
+    ground_weight: float = 0.45       # 「いまらしい語」への加点
+    neural_enabled: bool = True       # 小型ニューラル言語モデル
+    neural_dim: int = 96
+    neural_hidden: int = 192
+    neural_train_sec: float = 10.0    # 1 回の睡眠学習の時間予算
+    neural_idle_sec: float = 600.0    # 深い睡眠に入るまでの無操作時間
 
     # --- 発話生成 ---------------------------------------------------------
     base_temperature: float = 0.85

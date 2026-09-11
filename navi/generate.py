@@ -13,13 +13,14 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
 from .brain import BOS, EOS, N_SPECIAL, UNK, NaviBrain
 from .jp import Tok, can_end, can_follow, is_terminator, trim_to_valid_end
-from .parse import Pred, parse
+from .deixis import is_role
+from .parse import DEFAULT_FW, Pred, parse
 
 SILENCE = "……"
 
@@ -41,10 +42,21 @@ class GenParams:
     allow_question: bool = False
     question_rate: float = 0.0
     silence_threshold: float = -8.0   # これ未満なら黙る
+    loo_discount: float = 0.0         # 記憶を分母から外す度合い(0=そのまま 1=全部引く)
+    novelty_weight: float = 0.0       # 「新しくて、かつ壊れていない」発話への報酬
     allow_fact: bool = False          # 知っている事実で答えてよいか
     frame_weight: float = 0.0         # 選択選好(格フレーム)の採点重み
     semantic_weight: float = 0.0      # 意味ベクトルによる話題一致の重み
     fact_bias: float = 2.6            # 知っている事実で答えるときの下駄
+    allow_plan: bool = False          # 述語を先に決めてから組み立ててよいか
+    plan_candidates: int = 3
+    plan_bias: float = 0.0
+    modifier_rate: float = 0.0        # 名詞に連体修飾を付ける確率
+    adverb_rate: float = 0.0          # 述語に副詞を付ける確率
+    conjunction_rate: float = 0.0     # 2 つの節をつなぐ確率
+    ground_weight: float = 0.0        # 接地(いまの時間帯らしさ)の加点
+    intent_weight: float = 0.0        # 返答の意図の噛み合いの加点
+    nn_weight: float = 0.0            # ニューラル言語モデルの採点比重(alpha)
 
 
 @dataclass
@@ -59,9 +71,16 @@ class Context:
     valence: float = 0.0
     # --- 意味層(無ければ None のまま動く) ---------------------------------
     input_preds: List[Pred] = field(default_factory=list)
+    input_surfaces: Set[str] = field(default_factory=set)
     frames: Optional[object] = None     # CaseFrames
     embed: Optional[object] = None      # Embedding
     facts: Optional[object] = None      # FactStore
+    realizer: Optional[object] = None   # Realizer
+    deixis: Optional[object] = None     # Deixis
+    intents: Optional[object] = None    # Intents
+    intent_in: int = -1                 # 入力の意図クラスタ
+    ground: Optional[List[float]] = None  # 語ごとの「いまらしさ」
+    fw: Optional[object] = None         # FunctionWords
     turn: int = 0
 
 
@@ -74,6 +93,7 @@ class Candidate:
     score: float = 0.0
     detail: Dict[str, float] = field(default_factory=dict)
     is_question: bool = False
+    source: int = -1          # 出どころの記憶発話(思い出した発話なら index)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +168,8 @@ def sample_sentence(brain: NaviBrain, ctx: Context, p: GenParams,
                 s -= p.repetition_penalty * n   # 同じ語のループを抑える
             if cid in topic:
                 s += topic[cid]
+            if ctx.ground is not None and p.ground_weight > 0 and cid < len(ctx.ground):
+                s += p.ground_weight * ctx.ground[cid]
             scores[cid] = s
 
         # 終止の判断
@@ -216,11 +238,34 @@ def _mutation_jump(brain: NaviBrain, prev_tok: Optional[Tok], consec: int,
 # ---------------------------------------------------------------------------
 # 候補の採点
 # ---------------------------------------------------------------------------
-def fluency(brain: NaviBrain, ids: Sequence[int]) -> float:
-    """遷移確率の対数平均。文として「言い慣れている」ほど高い。"""
+def fluency(brain: NaviBrain, ids: Sequence[int], source=None,
+            discount: float = 0.0) -> float:
+    """遷移確率の対数平均。文として「言い慣れている」ほど高い。
+
+    source を渡すと **その発話を一度聞かなかったことにして** 採点する
+    (leave-one-out)。これが無いと、オペレーターが言った文は「その確率モデルを
+    作った当の文」なので定義上ほぼ最大値を取り、丸暗記の再生が常に勝ってしまう。
+
+    引くのは 1 回分だけであることが肝心。5 回聞いた言い回しは 4 回分が残るので
+    高いまま(本当に身についている)、1 回しか聞いていない文だけが崩れる
+    (ただの丸暗記だと分かる)。
+    """
     if not ids:
         return -20.0
     seq = [BOS] + list(ids) + [EOS]
+
+    drop = 0.0
+    src_pairs = set()
+    if source is not None and discount > 0.0:
+        # その発話が刻まれてから今までに受けた減衰を見積もって差し引く
+        cfg = brain.cfg
+        elapsed = max(0, brain.turns - source.turn) / max(1, cfg.decay_every_turns)
+        # 全部ではなく「一度分」。ここを count 倍にすると、何度も聞いた
+        # 言い回しまで捨ててしまい、成体が急に不器用になる。
+        drop = cfg.w_operator * (cfg.synapse_decay ** elapsed) * discount
+        sseq = [BOS] + list(source.ids) + [EOS]
+        src_pairs = set(zip(sseq, sseq[1:]))
+
     total = 0.0
     for a, b in zip(seq, seq[1:]):
         row = brain.bi.get(a)
@@ -228,7 +273,11 @@ def fluency(brain: NaviBrain, ids: Sequence[int]) -> float:
         if not row or tot <= 0:
             total += -6.0
             continue
-        total += math.log(max(row.get(b, 0.0), 1e-3) / tot)
+        c = row.get(b, 0.0)
+        if (a, b) in src_pairs:
+            c -= drop
+            tot -= drop
+        total += math.log(max(c, 1e-3) / max(tot, 1e-3))
     return total / (len(seq) - 1)
 
 
@@ -236,8 +285,10 @@ def score_candidate(brain: NaviBrain, ctx: Context, cand: Candidate,
                     p: GenParams) -> Candidate:
     ids = cand.ids
     keys = [i for i in ids if brain.is_content_id(i)]
+    cand_preds = parse([brain.tok_of(i) for i in ids]) if ids else []
 
-    flu = fluency(brain, ids)
+    src = brain.phrases[cand.source] if 0 <= cand.source < len(brain.phrases) else None
+    flu = fluency(brain, ids, src, p.loo_discount)
     rel = brain.relevance(ctx.input_keys, keys)
     # 直近の発話と丸かぶりしていないか(同じことを言い続けない)
     nov = 0.0
@@ -245,16 +296,23 @@ def score_candidate(brain: NaviBrain, ctx: Context, cand: Candidate,
         nov -= 3.0
     uniq_ratio = len(set(ids)) / max(1, len(ids))
     nov += 1.2 * (uniq_ratio - 1.0)
+    # 「オペレーターが一度も言っていない文」かどうか
+    cand.detail["new"] = 1.0 if (cand.source < 0
+                                 and cand.text not in brain.phrase_by_text) else 0.0
     # 内容語が 1 つも無い相槌だけの発話は弱い(が、短い時期は許す)
     substance = 0.6 * math.log1p(len(keys))
     # 長さ: 短すぎ・長すぎにペナルティ
     ideal = (p.min_len + p.max_len) / 2.0
     length = -0.08 * abs(len(ids) - ideal)
-    # 問いかけに問いかけで返さない
-    if ctx.asking and cand.is_question:
-        total_q = -2.2
-    else:
-        total_q = 0.0
+    # 返答の意図が噛み合っているか。
+    # (意図分類が働いていない間だけ「問いかけに問いかけで返さない」で代用する)
+    intent_term = 0.0
+    if ctx.intents is not None and ctx.intents.ready() and ctx.intent_in >= 0             and p.intent_weight > 0:
+        ci = ctx.intents.classify(ctx.intents.featurize(brain, ids, cand_preds))
+        intent_term = p.intent_weight * ctx.intents.score_reply(ctx.intent_in, ci)
+        cand.detail["intent"] = float(ci)
+    elif ctx.asking and cand.is_question:
+        intent_term = -2.2
     # 入力のオウム返し
     echo = 0.0
     if cand.text and cand.text == ctx.input_text and not p.allow_echo:
@@ -266,9 +324,12 @@ def score_candidate(brain: NaviBrain, ctx: Context, cand: Candidate,
     # 選択選好: その述語のその格に、その名詞を置いてよいか
     frame_term = 0.0
     if ctx.frames is not None and p.frame_weight > 0 and ids:
-        pmi, n = ctx.frames.score(parse([brain.tok_of(i) for i in ids]))
+        pmi, n = ctx.frames.score(cand_preds)
         if n:
             frame_term = p.frame_weight * pmi * min(1.0, n / 2.0)
+        if cand.strategy == "plan":
+            # 格フレームから組んだ文を格フレームで採点すると循環するので半減
+            frame_term *= 0.5
     # 話題の一致を、共起ではなく意味ベクトルの近さで測る
     sem = 0.0
     if ctx.embed is not None and p.semantic_weight > 0:
@@ -281,12 +342,27 @@ def score_candidate(brain: NaviBrain, ctx: Context, cand: Candidate,
     if cand.strategy.startswith("mimic"):
         mimic_pen = -p.mimic_len_penalty * len(ids)
 
+    # ニューラル言語モデルの採点。alpha の分だけ n-gram の流暢さと入れ替える。
+    nn_lp = cand.detail.get("nn_lp")
+    if nn_lp is not None and p.nn_weight > 0:
+        a = p.nn_weight
+        flu_term = (1.0 - a) * flu_term + a * (1.05 * nn_lp
+                                               + 0.085 * nn_lp * (len(ids) + 1))
+
+    # 新しさへの報酬。ただし「格フレームを破っていない」ことが門番。
+    # 無条件に足すと、壊れた文が「新しい」というだけで得をする。
+    novelty = 0.0
+    if p.novelty_weight > 0 and cand.detail["new"] > 0 and frame_term >= 0:
+        novelty = p.novelty_weight
+
     total = (flu_term + 2.4 * rel + nov + substance + length + echo + val + mimic_pen
-             + frame_term + sem + total_q + cand.detail.get("bias", 0.0))
+             + frame_term + sem + intent_term + novelty
+             + cand.detail.get("bias", 0.0))
     cand.score = total
     cand.detail.update({"flu": flu, "rel": rel, "nov": nov, "sub": substance,
                         "len": length, "echo": echo, "val": val, "mim": mimic_pen,
-                        "frame": frame_term, "sem": sem})
+                        "frame": frame_term, "sem": sem, "int": intent_term,
+                        "nvl": novelty})
     return cand
 
 
@@ -307,13 +383,14 @@ def _clip(brain: NaviBrain, ids: Sequence[int], max_len: int) -> List[int]:
 
 
 def _make_candidate(brain: NaviBrain, ids: List[int], strategy: str,
-                    bias: float = 0.0, is_question: bool = False) -> Optional[Candidate]:
+                    bias: float = 0.0, is_question: bool = False,
+                    source: int = -1) -> Optional[Candidate]:
     if not ids:
         return None
     text = "".join(brain.id2word[i] for i in ids)
     ann = _annotate(brain, ids)
     return Candidate(ids=ids, text=text, annotated=ann, strategy=strategy,
-                     detail={"bias": bias}, is_question=is_question)
+                     detail={"bias": bias}, is_question=is_question, source=source)
 
 
 def _annotate(brain: NaviBrain, ids: Sequence[int]) -> str:
@@ -369,7 +446,8 @@ def propose_mimic(brain: NaviBrain, ctx: Context, p: GenParams,
         for nxt, w in sorted(ph.next_idx.items(), key=lambda kv: -kv[1])[:2]:
             nph = brain.phrases[nxt]
             c = _make_candidate(brain, _clip(brain, nph.ids, p.max_len), "mimic-exact",
-                                bias=p.mimic_bias + 1.7, is_question=nph.is_question)
+                                bias=p.mimic_bias + 1.7, is_question=nph.is_question,
+                                source=nxt)
             if c:
                 out.append(c)
 
@@ -382,14 +460,14 @@ def propose_mimic(brain: NaviBrain, ctx: Context, p: GenParams,
             nph = brain.phrases[nxt]
             c = _make_candidate(brain, _clip(brain, nph.ids, p.max_len), "mimic-next",
                                 bias=p.mimic_bias + 1.6 * sim,
-                                is_question=nph.is_question)
+                                is_question=nph.is_question, source=nxt)
             if c:
                 out.append(c)
         # 2) その発話そのもの(相槌的な再利用)
         if sim < 0.98 or p.allow_echo:
             c = _make_candidate(brain, _clip(brain, ph.ids, p.max_len), "mimic-echo",
                                 bias=p.mimic_bias + 0.8 * sim,
-                                is_question=ph.is_question)
+                                is_question=ph.is_question, source=idx)
             if c:
                 out.append(c)
     return out
@@ -425,7 +503,12 @@ def propose_fact(brain: NaviBrain, ctx: Context, p: GenParams,
     fact = ctx.facts.query(ctx.input_preds, ctx.turn)
     if fact is None:
         return []
-    seed, _ = brain.encode(fact.obj)
+    obj = fact.obj
+    if is_role(obj):
+        if ctx.deixis is None:
+            return []
+        obj = ctx.deixis.surface_for(obj)
+    seed, _ = brain.encode(obj)
     if not seed:
         return []
     # 答えは短く。「ロックマンだよ。」で足りるのに語り出さないようにする。
@@ -445,6 +528,206 @@ def propose_fact(brain: NaviBrain, ctx: Context, p: GenParams,
     bare = _make_candidate(brain, list(seed), "fact", bias=p.fact_bias * 0.8)
     if bare:
         out.append(bare)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 述語を先に決めてから組み立てる (plan-then-realize)
+# ---------------------------------------------------------------------------
+# 日本語の素直な並び。主題を先に、対象を述語の直前に置く。
+CASE_ORDER = ("は", "も", "が", "から", "まで", "で", "へ", "に", "と", "より", "を")
+
+
+def _surface_of(ctx: Context, head: str) -> str:
+    if is_role(head):
+        return ctx.deixis.surface_for(head) if ctx.deixis is not None else ""
+    return head
+
+
+def _pick_predicate(brain: NaviBrain, ctx: Context, rng: random.Random,
+                    exclude: Optional[Set[str]] = None,
+                    connective: bool = False) -> Optional[str]:
+    frames, realizer = ctx.frames, ctx.realizer
+    pool = set()
+    for wid, _ in brain.related(ctx.input_keys, topn=12):
+        w = brain.id2word[wid]
+        if w in frames.pred_tot:
+            pool.add(w)
+    pool.update(w for w, _ in sorted(frames.pred_tot.items(),
+                                     key=lambda kv: -kv[1])[:40])
+    cands, weights = [], []
+    for w in pool:
+        if exclude and w in exclude:
+            continue
+        kind = frames.pred_kind.get(w, "verb")
+        if not realizer.knows(w, kind) or not frames.patterns.get(w):
+            continue
+        if connective and not realizer.can_connect(w, kind):
+            continue
+        sc = 0.5 * math.log1p(frames.pred_tot.get(w, 0.0))
+        wid = brain.word2id.get(w)
+        if ctx.embed is not None and ctx.embed.ready() and wid is not None \
+                and ctx.input_keys:
+            sc += 2.0 * max(ctx.embed.sim(wid, k) for k in ctx.input_keys)
+        cands.append(w)
+        weights.append(math.exp(sc))
+    if not cands:
+        return None
+    return rng.choices(cands, weights=weights, k=1)[0]
+
+
+def _pick_filler(brain: NaviBrain, ctx: Context, pred: str, case: str,
+                 used: Set[str], rng: random.Random) -> Optional[str]:
+    row = ctx.frames.frames.get(pred, {}).get(case, {})
+    if not row:
+        return None
+    nouns, weights = [], []
+    for noun, c in row.items():
+        fw = ctx.fw if ctx.fw is not None else DEFAULT_FW
+        if noun in used or noun in fw.questions:
+            continue
+        surface = _surface_of(ctx, noun)
+        if not surface:
+            continue
+        w = c ** 0.7
+        wid = brain.word2id.get(surface)
+        if ctx.embed is not None and ctx.embed.ready() and wid is not None \
+                and ctx.input_keys:
+            w *= math.exp(2.0 * max(ctx.embed.sim(wid, k) for k in ctx.input_keys))
+        if noun in ctx.input_surfaces:
+            w *= 3.0        # いま話題に出ている実体を優先して拾う
+        nouns.append(noun)
+        weights.append(w)
+    if not nouns:
+        return None
+    return rng.choices(nouns, weights=weights, k=1)[0]
+
+
+def _pick_from(table, rng: random.Random) -> Optional[str]:
+    if not table:
+        return None
+    return rng.choices([w for w, _ in table], weights=[v for _, v in table], k=1)[0]
+
+
+def _clause(brain: NaviBrain, ctx: Context, p: GenParams, rng: random.Random,
+            connective: bool = False, exclude: Optional[Set[str]] = None,
+            taken: Optional[Set[str]] = None
+            ) -> Tuple[Optional[List[int]], Optional[str], Set[str]]:
+    """1 節ぶんを組み立てて語彙 ID 列にする。"""
+    frames, realizer = ctx.frames, ctx.realizer
+    pred = _pick_predicate(brain, ctx, rng, exclude, connective)
+    if not pred:
+        return None, None, set()
+    kind = frames.pred_kind.get(pred, "verb")
+    form = realizer.sample_form(pred, kind, rng)
+    if form is None:
+        return None, None, set()
+    span = realizer.realize(pred, kind, form[0], form[1], rng,
+                            connective=connective)
+    if not span:
+        return None, None, set()
+    pattern = frames.sample_pattern(pred, rng)
+    if pattern is None:
+        return None, None, set()
+
+    fillers: Dict[str, str] = {}
+    used: Set[str] = set(taken or ())
+    for case in pattern:
+        noun = _pick_filler(brain, ctx, pred, case, used, rng)
+        if noun:
+            fillers[case] = noun
+            used.add(noun)
+    if not fillers:
+        return None, None, set()
+
+    # --- 語順: 実際に観測された並びがあればそれを使う ---------------------
+    order = frames.sample_order(pred, fillers.keys(), rng)
+    if not order:
+        order = [c for c in CASE_ORDER if c in fillers]
+
+    ids: List[int] = []
+    for case in order:
+        noun = fillers.get(case)
+        if not noun:
+            continue
+        nid, _ = brain.encode(_surface_of(ctx, noun))
+        cid = brain.word2id.get(case)
+        if not nid or cid is None:
+            continue
+        # --- 連体修飾: その名詞に付けられていた形容詞・連体詞 --------------
+        if rng.random() < p.modifier_rate:
+            mod = _pick_from(frames.modifiers(brain.id2word[nid[0]]), rng)
+            mid = brain.word2id.get(mod) if mod else None
+            if mid is not None and can_follow(None, brain.tok_of(mid), 0):
+                ids.append(mid)
+        ids.extend(nid)
+        ids.append(cid)
+    if not ids:
+        return None, None, set()
+
+    # --- 副詞: その述語に付けられていた副詞 --------------------------------
+    if rng.random() < p.adverb_rate:
+        adv = _pick_from(frames.adverbs(pred), rng)
+        aid = brain.word2id.get(adv) if adv else None
+        if aid is not None:
+            ids.append(aid)
+
+    for surface in span:
+        wid = brain.word2id.get(surface)
+        if wid is not None:
+            ids.append(wid)
+        else:
+            sub, _ = brain.encode(surface)
+            if not sub:
+                return None, None, set()
+            ids.extend(sub)
+    return ids, pred, used
+
+
+def _plan_once(brain: NaviBrain, ctx: Context, p: GenParams,
+               rng: random.Random) -> Optional[Candidate]:
+    ids, pred, used = _clause(brain, ctx, p, rng)
+    if not ids:
+        return None
+
+    # --- 節をつなぐ: 「パンを食べて、公園へ行く」 --------------------------
+    # 前の節と同じ名詞を二度出さないよう、使った語を渡す。
+    if rng.random() < p.conjunction_rate:
+        head, _hp, _hu = _clause(brain, ctx, p, rng, connective=True,
+                                 exclude={pred} if pred else None, taken=used)
+        if head and len(head) + len(ids) <= p.max_len:
+            ids = head + ids
+
+    toks = trim_to_valid_end([brain.tok_of(i) for i in ids])
+    if len(toks) < max(2, p.min_len):
+        return None
+    ids = [brain.word2id[t.surface] for t in toks]
+    if len(ids) > p.max_len:
+        return None
+    # 覚えている終止記号があれば締める
+    if not is_terminator(toks[-1].surface):
+        row = brain.bi.get(ids[-1]) or {}
+        ends = [(c, v) for c, v in row.items() if is_terminator(brain.id2word[c])]
+        if ends:
+            ids.append(max(ends, key=lambda kv: kv[1])[0])
+    return _make_candidate(brain, ids, "plan", bias=p.plan_bias)
+
+
+def propose_plan(brain: NaviBrain, ctx: Context, p: GenParams,
+                 rng: random.Random) -> List[Candidate]:
+    """述語 -> 格枠 -> 項 -> 線形化 の順に文を組み立てる。
+
+    左から右へ確率的に歩く生成は、途中で行き先を見失って破綻する。
+    先に「何について何をどうすると言うか」を決めてしまえば、
+    少なくとも文の骨格は壊れない。活用は realize.py が記憶から戻す。
+    """
+    if not p.allow_plan or ctx.frames is None or ctx.realizer is None:
+        return []
+    out: List[Candidate] = []
+    for _ in range(p.plan_candidates):
+        c = _plan_once(brain, ctx, p, rng)
+        if c:
+            out.append(c)
     return out
 
 
@@ -479,7 +762,8 @@ def propose_question(brain: NaviBrain, ctx: Context, p: GenParams,
 # エントリポイント
 # ---------------------------------------------------------------------------
 def generate(brain: NaviBrain, ctx: Context, p: GenParams,
-             rng: Optional[random.Random] = None) -> Candidate:
+             rng: Optional[random.Random] = None, neural=None,
+             pool_out: Optional[List[Candidate]] = None) -> Candidate:
     rng = rng or random
 
     # 答えを知っている問いかけには、まず答える。
@@ -488,25 +772,42 @@ def generate(brain: NaviBrain, ctx: Context, p: GenParams,
     known = propose_fact(brain, ctx, p, rng)
     if known:
         scored = [score_candidate(brain, ctx, c, p) for c in known]
+        if pool_out is not None:
+            pool_out.extend(sorted(scored, key=lambda c: -c.score))
         return max(scored, key=lambda c: c.score)
 
     # 知らない言葉に出会って好奇心が勝ったターンは、他の候補を捨てて聞き返す。
     questions = propose_question(brain, ctx, p, rng)
     if questions:
-        return score_candidate(brain, ctx, questions[0], p)
+        c = score_candidate(brain, ctx, questions[0], p)
+        if pool_out is not None:
+            pool_out.append(c)
+        return c
 
     cands: List[Candidate] = []
+    cands += propose_plan(brain, ctx, p, rng)
     cands += propose_generated(brain, ctx, p, rng)
     cands += propose_mimic(brain, ctx, p, rng)
 
     # 同一文の重複を除く
     seen: Set[str] = set()
-    uniq: List[Candidate] = []
+    pool: List[Candidate] = []
     for c in cands:
         if c.text in seen:
             continue
         seen.add(c.text)
-        uniq.append(score_candidate(brain, ctx, c, p))
+        pool.append(c)
+    if not pool:
+        return Candidate([], SILENCE, SILENCE, "silence")
+
+    # ニューラルの採点は候補をまとめて 1 回の forward で済ませる
+    if neural is not None and p.nn_weight > 0 and neural.ready():
+        for c, lp in zip(pool, neural.score_batch([c.ids for c in pool])):
+            c.detail["nn_lp"] = lp
+
+    uniq = [score_candidate(brain, ctx, c, p) for c in pool]
+    if pool_out is not None:
+        pool_out.extend(uniq)
 
     if not uniq:
         return Candidate([], SILENCE, SILENCE, "silence")

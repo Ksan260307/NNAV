@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .parse import Pred
 
@@ -41,6 +41,14 @@ class CaseFrames:
         self.pred_tot: Dict[str, float] = defaultdict(float)
         # 名詞 -> そのスロット集合(逆引き。類似度と埋め込みの文脈に使う)
         self.noun_slots: Dict[str, Dict[Slot, float]] = defaultdict(dict)
+        # 述語 -> 同時に立った格の組 -> 頻度。文を組み立てるときの型紙になる。
+        self.patterns: Dict[str, Dict[frozenset, float]] = defaultdict(dict)
+        self.pred_kind: Dict[str, str] = {}     # 述語 -> verb/adj/na/copula
+        # 名詞の直前に置かれた修飾語、述語の直前に置かれた副詞、そして語順。
+        # どれも隣り合ったトークンを数えているだけで、知識は入れていない。
+        self.noun_mods: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.pred_advs: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.orders: Dict[str, Dict[tuple, float]] = defaultdict(dict)
         self.total = 0.0
         self.observed = 0
 
@@ -51,6 +59,14 @@ class CaseFrames:
             if not p.lemma or p.kind == "query":
                 continue
             self.pred_tot[p.lemma] += w
+            self.pred_kind[p.lemma] = p.kind
+            cases = frozenset(a.case for a in p.args if a.case and a.head)
+            if cases:
+                row = self.patterns[p.lemma]
+                row[cases] = row.get(cases, 0.0) + w
+                order = tuple(a.case for a in p.args if a.case and a.head)
+                orow = self.orders[p.lemma]
+                orow[order] = orow.get(order, 0.0) + w
             for pred, case, noun in p.triples():
                 if not noun or len(noun) > 24:
                     continue
@@ -65,6 +81,42 @@ class CaseFrames:
                 n += 1
         self.observed += n
         return n
+
+    def observe_surface(self, toks, w: float = 1.0) -> None:
+        """隣り合ったトークンから、修飾のしかたを覚える。
+
+        (形容詞|連体詞) + 名詞   -> その名詞に付けられる修飾語
+        副詞 + 用言              -> その述語に付けられる副詞
+        """
+        for a, b in zip(toks, toks[1:]):
+            if b.pos == "名詞" and a.pos in ("形容詞", "連体詞")                     and a.pos1 in ("自立", "*"):
+                row = self.noun_mods[b.surface]
+                row[a.surface] = row.get(a.surface, 0.0) + w
+            elif a.pos == "副詞" and (
+                    (b.pos in ("動詞", "形容詞") and b.pos1 == "自立")
+                    or (b.pos == "名詞" and b.pos1 == "形容動詞語幹")):
+                key = b.base or b.surface
+                row = self.pred_advs[key]
+                row[a.surface] = row.get(a.surface, 0.0) + w
+
+    def modifiers(self, noun: str, topn: int = 6):
+        row = self.noun_mods.get(noun) or {}
+        return sorted(row.items(), key=lambda kv: -kv[1])[:topn]
+
+    def adverbs(self, pred: str, topn: int = 6):
+        row = self.pred_advs.get(pred) or {}
+        return sorted(row.items(), key=lambda kv: -kv[1])[:topn]
+
+    def sample_order(self, pred: str, cases, rng):
+        """実際に観測された語順のうち、使いたい格をすべて含むものを引く。"""
+        row = self.orders.get(pred)
+        want = set(cases)
+        if row:
+            ok = [(o, v) for o, v in row.items() if set(o) == want]
+            if ok:
+                return rng.choices([o for o, _ in ok],
+                                   weights=[v for _, v in ok], k=1)[0]
+        return None
 
     # ------------------------------------------------------------------
     def pmi(self, pred: str, case: str, noun: str) -> float:
@@ -101,6 +153,14 @@ class CaseFrames:
     def fillers(self, pred: str, case: str, topn: int = 8) -> List[Tuple[str, float]]:
         row = self.frames.get(pred, {}).get(case, {})
         return sorted(row.items(), key=lambda kv: -kv[1])[:topn]
+
+    def sample_pattern(self, pred: str, rng) -> Optional[frozenset]:
+        """その述語がよく取る格の組を 1 つ引く。"""
+        row = self.patterns.get(pred)
+        if not row:
+            return None
+        keys = list(row.keys())
+        return rng.choices(keys, weights=[row[k] for k in keys], k=1)[0]
 
     def cases_of(self, pred: str) -> List[Tuple[str, float]]:
         row = self.frames.get(pred, {})
@@ -191,6 +251,13 @@ class CaseFrames:
             "frames": {p: {c: dict(r) for c, r in cs.items()}
                        for p, cs in self.frames.items()},
             "pred_tot": dict(self.pred_tot),
+            "pred_kind": dict(self.pred_kind),
+            "noun_mods": {k: dict(v) for k, v in self.noun_mods.items()},
+            "pred_advs": {k: dict(v) for k, v in self.pred_advs.items()},
+            "orders": [[p, list(o), v] for p, row in self.orders.items()
+                       for o, v in row.items()],
+            "patterns": [[p, sorted(k), v] for p, row in self.patterns.items()
+                         for k, v in row.items()],
             "observed": self.observed,
         }
 
@@ -206,4 +273,13 @@ class CaseFrames:
                     self.total += v
                     self.noun_slots[noun][(pred, case)] = v
         self.pred_tot = defaultdict(float, d.get("pred_tot") or {})
+        self.pred_kind = dict(d.get("pred_kind") or {})
+        for k, v in (d.get("noun_mods") or {}).items():
+            self.noun_mods[k] = dict(v)
+        for k, v in (d.get("pred_advs") or {}).items():
+            self.pred_advs[k] = dict(v)
+        for pred, order, v in (d.get("orders") or []):
+            self.orders[pred][tuple(order)] = float(v)
+        for pred, cases, v in (d.get("patterns") or []):
+            self.patterns[pred][frozenset(cases)] = float(v)
         self.observed = int(d.get("observed", 0))

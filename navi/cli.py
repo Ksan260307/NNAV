@@ -7,7 +7,7 @@ import sys
 import time
 from typing import Optional
 
-from .config import ORIGIN_LABEL
+from .config import ORIGIN_LABEL, ORIGIN_OPERATOR
 from .daemon import NaviDaemon
 from .navi import NetNavi
 
@@ -50,6 +50,11 @@ HELP = """\
   /facts [語]      覚えている事実を見る
   /frames <述語>   その述語がどんな格を取ると思っているか
   /near <語>       意味ベクトル上で近い語
+  /senses <語>     その語をいつ使うか(時間帯との結び付き)
+  /intents         教師なしで分かれた発話の意図
+  /roles           「ぼく」「きみ」が誰を指していると思っているか
+  /why             直前の発話をなぜ選んだか(候補と採点)
+  /sleep           いま深い睡眠に入る(意味空間の編成・神経回路の学習)
   /top             いま脳内で重要度の高い語
   /dream           いますぐ夢(自己対話)を見せる
   /diary [n]       ナビが経験したことの記録(WAL)の末尾を見る
@@ -73,7 +78,7 @@ def banner(navi: NetNavi) -> None:
               f"web_user_agent に連絡先を書いてください。{C_RESET}")
 
 
-def show_status(navi: NetNavi) -> None:
+def show_status(navi: NetNavi) -> None:   # noqa: C901
     s = navi.status()
     cur, nxt, ratio = s["stage"], s["next"], s["progress"]
     bar_len = 28
@@ -86,7 +91,9 @@ def show_status(navi: NetNavi) -> None:
         print(f"  次の段階  : {nxt.code} [{bar}] {ratio*100:5.1f}%")
         print(f"              必要: 語彙 {nxt.need_vocab} / 対話 {nxt.need_turns}ターン"
               + (f" / 理解度 {nxt.need_understanding:.2f}"
-                 if nxt.need_understanding > 0 else ""))
+                 if nxt.need_understanding > 0 else "")
+              + (f" / 新規発話率 {nxt.need_novelty:.0%}"
+                 if nxt.need_novelty > 0 else ""))
     else:
         print("  最終段階に到達しています。")
     print(f"\n{C_BAR}== 電脳 =={C_RESET}")
@@ -96,6 +103,9 @@ def show_status(navi: NetNavi) -> None:
     print(f"  シナプス  : {s['edges']} 結合 / 連想 {s['assoc']} 語 / 記憶発話 {s['phrases']} 件")
     print(f"  学習量    : {s['tokens']} トークン (ネット由来 {s['web_tokens']})")
     print(f"  文脈一貫性: {s['coherence']:.2f}  (高いほど流暢)")
+    nbar = int(20 * min(1.0, s["novelty"]))
+    print(f"  新規発話率: {s['novelty'] * 100:5.1f}% "
+          f"[{'#' * nbar}{'-' * (20 - nbar)}] (思い出しではない発話)")
     print(f"  未書出差分: {s['wal_lines']} 行")
 
     c = s["comprehension"]
@@ -113,8 +123,34 @@ def show_status(navi: NetNavi) -> None:
     print(f"  事実      : {int(fa['facts'])}件 (矛盾 {int(fa['conflicts'])}件)")
     print(f"  意味ベクトル: {'構築済み' if s['embed_ready'] else '未構築'} "
           f"(再編成 {s['embed_builds']}回)")
+    if c.get("intent_ready"):
+        print(f"    意図の予測    : skill {c['intent_skill']:.3f}")
+    if c.get("anaphora_samples"):
+        print(f"    指示詞の解決  : {c['anaphora_rate']:.2f} "
+              f"({int(c['anaphora_samples'])}回中)")
+    rz, dc, it = s["realizer"], s["discourse"], s["intents"]
+    print(f"  活用の記憶: 述語{int(rz['preds'])}種 / {int(rz['forms'])}通り")
+    print(f"  指示詞    : {int(dc['resolved'])}/{int(dc['attempted'])} 解決")
+    print("  意図      : "
+          + (f"{int(it['k'])}種 / 返し方の適切さ {it['appropriateness']:.2f} "
+             f"(平均報酬 {it['mean_reward']:+.2f} / {int(it['rewarded'])}回)"
+             if it["ready"] else f"未分類({int(it['samples'])}/300 標本)"))
+    print(f"  接地      : {int(s['senses']['grounded'])}語が環境と結び付いている")
+    nn = s["neural"]
+    if nn["ready"]:
+        print(f"  神経回路  : {int(nn['params'])}パラメータ / {int(nn['steps'])}歩学習 "
+              f"/ perplexity {nn['perplexity']:.1f}")
+        bar = int(20 * s["alpha"])
+        print(f"  移行度    : {s['alpha']:.2f} [{'#' * bar}{'-' * (20 - bar)}] "
+              f"(n-gram <-> 神経回路)")
+    else:
+        print(f"  神経回路  : 未構築 (コーパス {int(nn['corpus'])}/300文)")
+    if s["deixis"]["names"]:
+        print("  役割      : " + ", ".join(f"{k}={v}" for k, v in
+                                           s["deixis"]["names"].items()))
     for old, new in s["conflicts"]:
-        print(f"  {C_WARN}? {old.text()}  <->  {new.text()}{C_RESET}")
+        print(f"  {C_WARN}? {old.text(navi.deixis)}  <->  "
+              f"{new.text(navi.deixis)}{C_RESET}")
     m = s["mood"]
     print(f"\n{C_BAR}== 気分 =={C_RESET}")
     print(f"  {s['mood_label']}  元気{m.energy:.2f} 好奇心{m.curiosity:.2f} "
@@ -166,6 +202,7 @@ def show_diary(navi: NetNavi, n: int = 15) -> None:
 def run(data_dir: str = "navi_data") -> None:
     setup_console()
     navi = NetNavi(data_dir=data_dir)
+    navi.debug_pool = True      # /why のために候補を残す
     show_raw = True
 
     def speak(text: str) -> None:
@@ -264,6 +301,8 @@ def run(data_dir: str = "navi_data") -> None:
                 continue
             if low.startswith("/facts"):
                 key = text[len("/facts"):].strip()
+                if key:
+                    key = navi.deixis.normalize(key, ORIGIN_OPERATOR)
                 fs = (navi.facts.about(key, navi.brain.turns) if key
                       else sorted(navi.facts.all_facts(),
                                   key=lambda f: -f.confidence(navi.brain.turns))[:20])
@@ -271,7 +310,8 @@ def run(data_dir: str = "navi_data") -> None:
                     print(f"{C_SYS}まだ何も覚えていません。{C_RESET}")
                 for f in fs[:20]:
                     src = ORIGIN_LABEL.get(f.origin, "?")
-                    print(f"  {f.text()}   {C_SYS}<{src}> x{f.count:.0f}{C_RESET}")
+                    print(f"  {f.text(navi.deixis)}   "
+                          f"{C_SYS}<{src}> x{f.count:.0f}{C_RESET}")
                 continue
             if low.startswith("/frames"):
                 pred = text[len("/frames"):].strip()
@@ -301,6 +341,74 @@ def run(data_dir: str = "navi_data") -> None:
                         print("  " + ("  ".join(f"{w}({v:.2f})" for w, v in sim)
                                       or "近い語が見つかりません"))
                 continue
+            if low.startswith("/senses"):
+                word = text[len("/senses"):].strip()
+                wid = navi.brain.word2id.get(word)
+                if wid is None:
+                    print(f"{C_SYS}「{word}」はまだ知りません。{C_RESET}")
+                else:
+                    print(f"  {word}: {navi.senses.profile(wid)}")
+                    hist = navi.senses.hour_hist(wid)
+                    if hist:
+                        top = max(hist) or 1.0
+                        bars = "".join("#" if h > top * 0.6 else
+                                       "+" if h > top * 0.3 else "." for h in hist)
+                        print(f"  0時 {bars} 23時")
+                continue
+            if low.startswith("/intents"):
+                if not navi.intents.ready():
+                    print(f"{C_SYS}まだ意図を分けられていません "
+                          f"({len(navi.intents.reservoir)}/300 標本){C_RESET}")
+                else:
+                    for i in range(navi.intents.k):
+                        ex = navi.intents.examples.get(i) or []
+                        print(f"  意図{i}: " + (" / ".join(ex[:3]) or "(例なし)"))
+                    st = navi.intents.stats()
+                    print(f"{C_SYS}  返し方の適切さ {st['appropriateness']:.2f} "
+                          f"(平均報酬 {st['mean_reward']:+.2f} / "
+                          f"{int(st['rewarded'])}回の反応から){C_RESET}")
+                    for a_ in sorted(navi.intents.reward):
+                        row = navi.intents.reward[a_]
+                        best = max(row.items(),
+                                   key=lambda kv: kv[1][0] / max(kv[1][1], 1))
+                        print(f"{C_SYS}  意図{a_} には 意図{best[0]} で返すのが良い "
+                              f"(平均{best[1][0] / max(best[1][1], 1):+.2f}"
+                              f"/{int(best[1][1])}回){C_RESET}")
+                continue
+            if low.startswith("/roles"):
+                d = navi.deixis
+                print(f"  あなたが「ぼく」と言う -> あなた自身"
+                      f"{' (' + d.name_of('@OP') + ')' if d.name_of('@OP') else ''}")
+                print(f"  あなたが「きみ」と言う -> ナビ"
+                      f"{' (' + d.name_of('@NAVI') + ')' if d.name_of('@NAVI') else ''}")
+                print(f"  ナビが自分を呼ぶとき   -> {d.surface_for('@NAVI')}")
+                print(f"  ナビがあなたを呼ぶとき -> {d.surface_for('@OP')}")
+                continue
+            if low.startswith("/why"):
+                if not navi.last_pool:
+                    print(f"{C_SYS}まだ説明できる発話がありません。{C_RESET}")
+                for c in navi.last_pool[:6]:
+                    d = c.detail
+                    print(f"  {c.score:+7.2f} [{c.strategy:<12}] {c.text}")
+                    print(f"{C_SYS}          流暢さ{d.get('flu', 0):+.2f} "
+                          f"関連{d.get('rel', 0):+.2f} 選択選好{d.get('frame', 0):+.2f} "
+                          f"意味{d.get('sem', 0):+.2f} 意図{d.get('int', 0):+.2f} "
+                          f"下駄{d.get('bias', 0):+.2f}{C_RESET}")
+                continue
+            if low.startswith("/sleep"):
+                print(f"{C_SYS}……深い睡眠に入ります{C_RESET}", flush=True)
+                r = navi.deep_sleep()
+                if not r:
+                    print(f"{C_SYS}まだ眠るほど溜まっていません。{C_RESET}")
+                if "embed" in r:
+                    print(f"{C_OK}  意味空間を編成し直した(通算{r['embed']}回){C_RESET}")
+                if "intents" in r:
+                    print(f"{C_OK}  発話の意図を{r['intents']}種類に整理した{C_RESET}")
+                if "neural" in r:
+                    n = r["neural"]
+                    print(f"{C_OK}  神経回路を{n['steps']}歩鍛えた "
+                          f"(loss {n['loss']:.3f} / {n['sec']:.0f}秒){C_RESET}")
+                continue
             if low.startswith("/pin"):
                 word = text[len("/pin"):].strip()
                 print(f"{C_SYS}{navi.pin(word)}{C_RESET}")
@@ -315,10 +423,10 @@ def run(data_dir: str = "navi_data") -> None:
             if reply.new_words:
                 print(f"{C_SYS}       (新しい言葉を {reply.new_words} 語おぼえた){C_RESET}")
             for f in reply.facts:
-                print(f"{C_SYS}       (おぼえた: {f.text()}){C_RESET}")
+                print(f"{C_SYS}       (おぼえた: {f.text(navi.deixis)}){C_RESET}")
             for old, new in reply.clashes:
-                print(f"{C_WARN}       (あれ? 前は「{old.text()}」だったけど"
-                      f"「{new.text()}」になった){C_RESET}")
+                print(f"{C_WARN}       (あれ? 前は「{old.text(navi.deixis)}」だったけど"
+                      f"「{new.text(navi.deixis)}」になった){C_RESET}")
             if reply.stage_up:
                 st = reply.stage_up
                 print(f"\n{C_OK}*** 成長: {st.code} / {st.name} に到達 ***{C_RESET}")

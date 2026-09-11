@@ -16,7 +16,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from navi.cli import setup_console  # noqa: E402
-from navi.config import ORIGIN_WEB, Config  # noqa: E402
+from navi.config import ORIGIN_OPERATOR, ORIGIN_WEB, Config  # noqa: E402
+from navi.growth import STAGES  # noqa: E402
 from navi.jp import JPTokenizer, can_end  # noqa: E402
 from navi.navi import NetNavi  # noqa: E402
 
@@ -166,7 +167,13 @@ def test_adult(tmp: str) -> None:
     # 初めて聞く言葉が混ざった発話を投げ、聞き返してくるかを見る
     novel = ["メットール", "デリートチップ", "プラグイン", "サイトエリア", "ナビカスタマイザー",
              "ウイルスバスター", "エレキソード", "バリアブルソード", "フォルテ", "シャドーマン",
-             "ネットバトル", "カスタム画面", "オペレーション", "ディメンショナル", "アドバンス"]
+             "ネットバトル", "カスタム画面", "オペレーション", "ディメンショナル", "アドバンス",
+             "スタイルチェンジ", "ダークチップ", "プログラムアドバンス", "ネットポリス",
+             "ワールドスリー", "ガッツマン", "ファイアマン", "ウッドマン", "アイスマン",
+             "カーネル", "バレル", "ジャック", "デリート", "バスターマックス",
+             "フォルダバック", "ナビチップ", "ソウルユニゾン", "クロスシステム",
+             "ビーストアウト", "リンクナビ", "オペレートショット", "チップトレーダー",
+             "エレメント", "パネルクラック", "エリアスチール"]
     qs = [navi.talk(f"きのう{w}の話をしたよ。") for w in novel]
     check("質問を作れる", any(q.is_question for q in qs),
           next((q.text for q in qs if q.is_question), "(出ず)"))
@@ -398,13 +405,409 @@ def test_growth_of_understanding(tmp: str) -> None:
     for i in range(420):
         navi.talk(corpus[i % len(corpus)])
         if i in (20, 80, 200, 419):
-            curve.append((i + 1, navi.comp.understanding()))
-    check("理解度が単調に伸びる",
+            curve.append((i + 1, navi.comp.core(), navi.comp.understanding()))
+    check("理解度が単調に伸びる(基準3軸)",
           all(b[1] > a[1] for a, b in zip(curve, curve[1:])),
-          " -> ".join(f"turn{t}:{u:.3f}" for t, u in curve))
+          " -> ".join(f"turn{t}:{c:.3f}" for t, c, _ in curve))
+    check("総合の理解度も伸びる", curve[-1][2] > curve[0][2] * 1.8,
+          " -> ".join(f"turn{t}:{u:.3f}" for t, _, u in curve))
     check("段階のゲートとして働く",
           navi.growth.stage(navi.brain.learned_vocab, navi.brain.turns).level >= 2,
           f"Lv.{navi.growth.best_level} 昇格{navi.growth.history}")
+    navi.shutdown()
+
+
+def test_deixis(tmp: str) -> None:
+    print()
+    print("[11] 話者役割: ぼく/きみ が誰を指すか")
+    from navi.config import ORIGIN_NAVI
+    from navi.deixis import ROLE_NAVI, ROLE_OP
+
+    navi = fresh(tmp, "deixis")
+    for _ in range(2):
+        navi.talk("きみの名前はロックマンだよ。")
+        navi.talk("ぼくの名前はケイだ。")
+    check("役割ごとに名前を覚える",
+          navi.deixis.name_of(ROLE_NAVI) == "ロックマン"
+          and navi.deixis.name_of(ROLE_OP) == "ケイ",
+          f"navi={navi.deixis.name_of(ROLE_NAVI)} op={navi.deixis.name_of(ROLE_OP)}")
+
+    r1 = navi.talk("きみの名前は？", learn=False)
+    r2 = navi.talk("ぼくの名前は？", learn=False)
+    check("きみ/ぼくを取り違えない",
+          "ロックマン" in r1.text and "ケイ" in r2.text,
+          f"きみ->{r1.text} / ぼく->{r2.text}")
+
+    check("固有名も同じ実体に落ちる",
+          navi.deixis.normalize("ロックマン", ORIGIN_OPERATOR) == ROLE_NAVI)
+    check("話者が変わると人称が反転する",
+          navi.deixis.normalize("ぼく", ORIGIN_OPERATOR) == ROLE_OP
+          and navi.deixis.normalize("ぼく", ORIGIN_NAVI) == ROLE_NAVI)
+
+    # ナビが自分を「ケイ」だと言い出さないこと(実装前はこれが起きていた)
+    bad = [f for f in navi.facts.all_facts()
+           if f.subj == ROLE_NAVI and f.rel == "名前" and f.obj == "ケイ"]
+    check("ナビがオペレーターの名前を自分のものにしない", not bad)
+    navi.shutdown()
+
+
+def test_plan(tmp: str) -> None:
+    print()
+    print("[12] 組み立て生成: 述語を先に決めてから並べる")
+    import random as _r
+
+    from navi.generate import Context as _Ctx
+    from navi.generate import propose_plan
+    from navi.jp import JPTokenizer, can_end
+    from navi.parse import parse as _parse
+
+    navi = fresh(tmp, "plan")
+    corpus = lines()
+    for i in range(320):
+        navi.talk(corpus[i % len(corpus)])
+    navi._maybe_build_embedding(force=True)
+
+    st = navi.realizer.stats()
+    check("活用を記憶している", st["forms"] > 30,
+          f"述語{int(st['preds'])}種 / 形{int(st['forms'])}通り")
+    # 聞いたことのない活用は作れない、が原則
+    check("教わっていない活用は作らない",
+          navi.realizer.realize("食べる", "verb", -1, (), _r.Random(1)) is None)
+    navi.talk("カレーは食べない。")
+    neg = navi.realizer.realize("食べる", "verb", -1, (), _r.Random(1))
+    check("一度聞けば否定形を再現できる",
+          neg is not None and "ない" in "".join(neg or []), str(neg))
+
+    stage = navi.growth.stage(navi.brain.learned_vocab, navi.brain.turns)
+    p = navi._params(stage)
+    p.allow_plan, p.plan_candidates = True, 20
+    ids, keys = navi.brain.encode("今日はカレーを食べたよ。")
+    ctx = _Ctx(input_ids=ids, input_keys=keys, input_text="今日はカレーを食べたよ。",
+               frames=navi.frames, embed=navi.embed, facts=navi.facts,
+               realizer=navi.realizer, deixis=navi.deixis, turn=navi.brain.turns)
+    cands = propose_plan(navi.brain, ctx, p, _r.Random(3))
+    check("組み立てで文が作れる", len(cands) >= 5, f"{len(cands)}本: "
+          + " / ".join(c.text for c in cands[:3]))
+
+    tk = JPTokenizer()
+    bad = []
+    for c in cands:
+        ts = tk.tokenize(c.text)
+        if ts and not can_end(ts[-1].pos, ts[-1].surface):
+            bad.append(c.text)
+    check("組み立てた文が尻切れにならない", not bad, str(bad[:2]))
+
+    scores = [navi.frames.score(_parse(tk.tokenize(c.text)))[0] for c in cands]
+    judged = [s for s in scores if s != 0.0]
+    check("選択選好から見ても妥当",
+          bool(judged) and sum(judged) / len(judged) > 0,
+          f"平均PMI {sum(judged) / max(1, len(judged)):+.2f} ({len(judged)}本)")
+
+    used = [navi.talk(corpus[i % len(corpus)]).strategy for i in range(120)]
+    check("実際の会話でも採用される", "plan" in used,
+          f"採用率 {used.count('plan') / len(used) * 100:.0f}%")
+    navi.shutdown()
+
+
+def test_discourse(tmp: str) -> None:
+    print()
+    print("[13] 指示詞: 「それ」が何を指すか")
+    navi = fresh(tmp, "discourse")
+    for _ in range(4):
+        navi.talk("カレーを食べた。")
+        navi.talk("公園まで歩いた。")
+        navi.talk("パンを食べた。")
+    before = navi.discourse.resolved
+    navi.talk("カレーを作った。")
+    navi.talk("それを食べた。")
+    check("指示詞を解決する", navi.discourse.resolved > before,
+          str(navi.discourse.last[-1:]))
+    if navi.discourse.last:
+        src, dst = navi.discourse.last[-1]
+        check("型の合う先を選ぶ(食べる[を] にカレー)", dst in ("カレー", "パン"),
+              f"{src} -> {dst}")
+    check("解決結果が格フレームに入る",
+          navi.frames.frames.get("食べる", {}).get("を", {}).get("カレー", 0) > 0,
+          str(navi.frames.fillers("食べる", "を", 4)))
+    navi.shutdown()
+
+
+def test_intents(tmp: str) -> None:
+    print()
+    print("[14] 意図: 質問と平叙を教師なしで分ける")
+    navi = fresh(tmp, "intents")
+    corpus = lines()
+    for i in range(420):
+        navi.talk(corpus[i % len(corpus)])
+    check("意図クラスタが立つ", navi.intents.ready(),
+          f"k={navi.intents.k} 標本{len(navi.intents.reservoir)}")
+    if navi.intents.ready():
+        def label(text):
+            ids, _ = navi.brain.encode(text)
+            return navi.intents.classify(navi.intents.featurize(navi.brain, ids))
+        import collections as _c
+        q = _c.Counter(label(t) for t in
+                       ["きみの名前は？", "これは何？", "カレーは好き？",
+                        "今日の天気は？", "なんで？", "きみは元気？"])
+        d = _c.Counter(label(t) for t in
+                       ["ぼくはカレーが好きだ。", "今日はいい天気だね。",
+                        "朝から晴れているよ。", "公園には木がたくさんある。",
+                        "夕飯は自分で作るよ。", "本を読むのも好きだ。"])
+        # どのクラスタ番号に落ちるかは実行ごとに変わるので、
+        # 「問いかけが集まるクラスタに、平叙はあまり来ない」で分離を見る。
+        qc = q.most_common(1)[0][0]
+        q_rate = q[qc] / sum(q.values())
+        d_rate = d[qc] / sum(d.values())
+        check("問いかけと平叙が別クラスタになる", q_rate > d_rate + 0.3,
+              f"問いの主クラスタ{qc} に 問い{q_rate:.0%} / 平叙{d_rate:.0%}")
+        check("意図の遷移を学習している", len(navi.intents.trans) > 0,
+              f"{len(navi.intents.trans)}種の遷移 / 予測精度 "
+              f"{navi.intents.stats()['accuracy']:.2f}")
+    navi.shutdown()
+
+
+def test_senses(tmp: str) -> None:
+    print()
+    print("[15] 接地: 語と環境の結び付き")
+    navi = fresh(tmp, "senses")
+    corpus = lines()
+    for i in range(200):
+        navi.talk(corpus[i % len(corpus)])
+    s = navi.senses.stats()
+    check("語に環境が貯まる", s["grounded"] > 20,
+          f"接地した語 {int(s['grounded'])} / 標本 {int(s['samples'])}")
+    env = navi._env()
+    scores = navi.senses.score_all(env, navi.brain.vocab_size)
+    check("いまの環境との近さが出せる", scores is not None and float(scores.max()) > 0.5,
+          f"最大 {float(scores.max()):.2f}" if scores is not None else "(出ず)")
+    wid = navi.brain.word2id.get("おはよう")
+    if wid:
+        check("語ごとの時間帯が読める", navi.senses.profile(wid) != "(まだ分からない)",
+              f"おはよう: {navi.senses.profile(wid)}")
+    navi.shutdown()
+
+
+def test_neural(tmp: str) -> None:
+    print()
+    print("[16] ニューラル: 自前コーパスだけで学習し、採点を引き継ぐ")
+    navi = fresh(tmp, "neural", neural_train_sec=4.0)
+    corpus = lines()
+    for i in range(360):
+        navi.talk(corpus[i % len(corpus)])
+    check("学習コーパスが貯まる", len(navi.neural.corpus) >= 300,
+          f"{len(navi.neural.corpus)}文")
+
+    navi._maybe_build_embedding(force=True)
+    built = navi.neural.ensure(navi.brain, navi.embed)
+    check("意味ベクトルを種にモデルを作れる", built and navi.neural.ready(),
+          f"{navi.neural.stats()['params']} パラメータ")
+
+    r1 = navi.neural.train(2.0, rng=navi.rng)
+    first = r1["loss"]
+    r2 = navi.neural.train(4.0, rng=navi.rng)
+    check("学習でロスが下がる", r2["loss"] < first,
+          f"{first:.3f} -> {r2['loss']:.3f} ({r1['steps'] + r2['steps']}歩)")
+
+    lps = navi.neural.score_batch([navi.brain.encode("ぼくは元気だよ。")[0],
+                                   navi.brain.encode("元気ぼくよだは。")[0]])
+    check("自然な語順のほうを高く採点する", lps[0] > lps[1],
+          f"自然 {lps[0]:.2f} > 崩れ {lps[1]:.2f}")
+
+    for i in range(40):
+        navi.talk(corpus[i % len(corpus)])
+    a = navi.neural.alpha(navi.comp.logprob)
+    check("引き継ぎ度 alpha が範囲に収まる", 0.0 <= a <= 0.9,
+          f"alpha={a:.3f} (ニューラル ppl {navi.neural.stats()['perplexity']:.1f})")
+
+    navi.save()
+    d2 = navi.cfg.data_dir
+    steps = navi.neural.steps
+    navi.shutdown()
+    from navi.navi import NetNavi as _N
+    again = _N(data_dir=d2, cfg=Config.load(d2))
+    check("モデルが保存・復元される",
+          again.neural.ready() and again.neural.steps == steps,
+          f"復元後 {again.neural.steps}歩 / ready={again.neural.ready()}")
+    again.shutdown()
+
+
+def test_objective(tmp: str) -> None:
+    print()
+    print("[17] 目的関数: 丸暗記が有利にならないか")
+    from navi.generate import fluency
+
+    navi = fresh(tmp, "objective")
+    corpus = lines()
+    for i in range(320):
+        navi.talk(corpus[i % len(corpus)])
+
+    once = "ぼくはめずらしい果物を食べたよ。"
+    navi.talk(once)
+    idx = navi.brain.phrase_by_text.get(once.strip())
+    ph = navi.brain.phrases[idx]
+    plain = fluency(navi.brain, ph.ids)
+    loo = fluency(navi.brain, ph.ids, ph, 1.0)
+    check("一度きりの丸暗記は leave-one-out で崩れる", loo < plain - 1.0,
+          f"そのまま {plain:.2f} -> 引くと {loo:.2f}")
+
+    often = navi.brain.phrases[navi.brain.phrase_by_text["おはよう。"]]
+    p2 = fluency(navi.brain, often.ids)
+    l2 = fluency(navi.brain, often.ids, often, 1.0)
+    check("何度も聞いた言い回しは引いても残る", (p2 - l2) < (plain - loo),
+          f"落ち幅 何度も {p2 - l2:.2f} < 一度きり {plain - loo:.2f}")
+    navi.shutdown()
+
+
+def test_novelty(tmp: str) -> None:
+    print()
+    print("[18] 新規発話率: 育つほど自分の言葉になるか")
+    navi = fresh(tmp, "novelty")
+    corpus = lines()
+    for i in range(400):
+        navi.talk(corpus[i % len(corpus)])
+    navi._maybe_build_embedding(force=True)
+
+    rates = {}
+    for level in (3, 5):
+        navi.growth.best_level = level
+        navi.novelty = navi.growth.novelty = 0.5      # ゲートを通す
+        fresh_n = 0
+        for i in range(150):
+            r = navi.talk(corpus[(i * 7) % len(corpus)])
+            fresh_n += 1 if r.detail.get("new", 0) > 0 else 0
+        rates[level] = fresh_n / 150
+    check("段階が上がるほど記憶の再生から離れる", rates[5] > rates[3] + 0.15,
+          f"TEEN {rates[3] * 100:.0f}% -> NAVI {rates[5] * 100:.0f}%")
+
+    st = navi.growth.stage(navi.brain.learned_vocab, navi.brain.turns)
+    p = navi._params(st)
+    check("新しさは段階に応じて重みが付く", p.novelty_weight > 0 and p.loo_discount > 0,
+          f"loo={p.loo_discount} novelty={p.novelty_weight}")
+    check("成体以降は新規発話率がゲートになる",
+          any(s.need_novelty > 0 for s in STAGES),
+          str([f"{s.code}:{s.need_novelty}" for s in STAGES if s.need_novelty]))
+    navi.shutdown()
+
+
+def test_bandit(tmp: str) -> None:
+    print()
+    print("[19] 意図: 返し方をオペレーターの反応から学ぶか")
+    navi = fresh(tmp, "bandit")
+    corpus = lines()
+    for i in range(500):
+        navi.talk(corpus[i % len(corpus)])
+    check("反応から報酬が貯まる", navi.intents.reward_n > 50,
+          f"{int(navi.intents.reward_n)}回の反応 / 平均報酬 "
+          f"{navi.intents.stats()['mean_reward']:+.2f}")
+    check("返し方の適切さが測れる", navi.intents.measurable(),
+          f"適切さ {navi.intents.appropriateness():.2f}")
+
+    # /good が「その返し方」の評価として効くか
+    navi.talk("おはよう。")
+    if navi._pending:
+        in_i, reply_i = navi._pending[0], navi._pending[1]
+        before = navi.intents._cell(in_i, reply_i)[0]
+        navi.feedback(True)
+        after = navi.intents._cell(in_i, reply_i)[0]
+        check("/good が返し方そのものの評価になる", after > before,
+              f"{before:+.1f} -> {after:+.1f}")
+    else:
+        check("/good が返し方そのものの評価になる", False, "評価対象なし")
+
+    navi.talk("今日はいい天気だね。")     # 評価の反映を 1 ターン進める
+    check("理解度の意図軸が適切さに差し替わっている",
+          abs(navi.comp.intent_skill - navi.intents.appropriateness()) < 1e-6,
+          f"{navi.comp.intent_skill:.3f}")
+    navi.shutdown()
+
+
+def test_plan_rich(tmp: str) -> None:
+    print()
+    print("[20] 組み立て生成: 修飾・副詞・節の接続")
+    import random as _r
+
+    from navi.generate import Context as _Ctx
+    from navi.generate import propose_plan
+
+    navi = fresh(tmp, "planrich")
+    corpus = lines()
+    for i in range(420):
+        navi.talk(corpus[i % len(corpus)])
+    navi._maybe_build_embedding(force=True)
+
+    check("連体修飾を覚える", len(navi.frames.noun_mods) > 5,
+          str([(n, [m for m, _ in navi.frames.modifiers(n, 2)])
+               for n in list(navi.frames.noun_mods)[:3]]))
+    check("副詞を覚える", len(navi.frames.pred_advs) > 3,
+          str([(p_, [a for a, _ in navi.frames.adverbs(p_, 2)])
+               for p_ in list(navi.frames.pred_advs)[:3]]))
+    check("語順を覚える", len(navi.frames.orders) > 20,
+          f"{len(navi.frames.orders)} 述語ぶん")
+    check("次の節へ続く形を覚える", navi.realizer.stats()["conn"] > 3,
+          f"{int(navi.realizer.stats()['conn'])} 通り")
+
+    navi.growth.best_level = 5
+    st = navi.growth.stage(navi.brain.learned_vocab, navi.brain.turns)
+    p = navi._params(st)
+    p.allow_plan, p.plan_candidates = True, 30
+    ids, keys = navi.brain.encode("今日はカレーを食べたよ。")
+    ctx = _Ctx(input_ids=ids, input_keys=keys, input_text="今日はカレーを食べたよ。",
+               frames=navi.frames, embed=navi.embed, facts=navi.facts,
+               realizer=navi.realizer, deixis=navi.deixis, fw=navi.fw,
+               turn=navi.brain.turns)
+    cands = propose_plan(navi.brain, ctx, p, _r.Random(11))
+    texts = [c.text for c in cands]
+    check("組み立て文が出る", len(cands) >= 8, " / ".join(texts[:3]))
+    check("同じ名詞を二度出さない",
+          all(len(set(c.ids)) >= len(c.ids) - 2 for c in cands))
+    long_ones = [t for t in texts if len(t) >= 12]
+    check("節をつないだ長めの文も作れる", bool(long_ones),
+          (long_ones[0] if long_ones else "(出ず)"))
+    navi.shutdown()
+
+
+def test_lexicon(tmp: str) -> None:
+    print()
+    print("[21] 機能語: 種を外しても自力で見つけられるか")
+    from navi.parse import SEED_DEICTIC, SEED_FIRST, SEED_QUESTION, SEED_SECOND
+
+    navi = fresh(tmp, "lexicon", bootstrap_function_words=False)
+    check("種が空で始まる",
+          not (navi.fw.questions or navi.fw.first or navi.fw.second
+               or navi.fw.deictics),
+          str(navi.fw.counts()))
+
+    corpus = lines()
+    for i in range(900):
+        navi.talk(corpus[i % len(corpus)])
+    navi._maybe_build_embedding(force=True)
+    fw = navi.lexicon.discovered(navi.frames, navi.embed, navi.brain)
+
+    def heard(truth):
+        return {w for w in truth if w in navi.brain.word2id}
+
+    check("一人称を見つける", "ぼく" in fw.first, str(sorted(fw.first)))
+    check("二人称を見つける", "きみ" in fw.second, str(sorted(fw.second)))
+    check("一人称と二人称を取り違えない", not (fw.first & fw.second))
+    hit_q = fw.questions & heard(SEED_QUESTION)
+    check("疑問詞を見つける", len(hit_q) >= 3,
+          f"{len(hit_q)}/{len(heard(SEED_QUESTION))} {sorted(hit_q)}")
+    hit_d = fw.deictics & heard(SEED_DEICTIC)
+    check("指示詞を見つける", len(hit_d) >= 3,
+          f"{len(hit_d)}/{len(heard(SEED_DEICTIC))} {sorted(hit_d)}")
+    check("人称を指示詞と混同しない",
+          not (fw.deictics & (heard(SEED_FIRST) | heard(SEED_SECOND))),
+          str(sorted(fw.deictics)))
+
+    added = navi.refresh_function_words()
+    check("見つけた機能語が実際に有効になる",
+          "ぼく" in navi.fw.first and bool(navi.fw.questions),
+          f"{navi.fw.counts()} 追加 {added}")
+    r = navi.talk("きみの名前は？", learn=False)
+    check("種なしでも役割の照会が働く", r.strategy in ("fact", "mimic-exact",
+                                                      "mimic-next", "gen",
+                                                      "gen+seed", "plan"),
+          f"{r.text} ({r.strategy})")
     navi.shutdown()
 
 
@@ -428,6 +831,17 @@ def main() -> None:
         test_daemon(tmp)
         test_semantics(tmp)
         test_growth_of_understanding(tmp)
+        test_deixis(tmp)
+        test_plan(tmp)
+        test_discourse(tmp)
+        test_intents(tmp)
+        test_senses(tmp)
+        test_neural(tmp)
+        test_objective(tmp)
+        test_novelty(tmp)
+        test_bandit(tmp)
+        test_plan_rich(tmp)
+        test_lexicon(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

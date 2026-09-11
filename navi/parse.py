@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 from .jp import Tok, is_terminator
 
@@ -43,13 +43,60 @@ MODALITY = {
     "ます": "polite", "です": "polite",
 }
 
-# --- 疑問詞 ---------------------------------------------------------------
-# 事実の照会にはどうしても「何を聞かれているか」の判定が要る。
-# ここだけは閉じた語彙を持ち込んでいる (Config.use_question_words で無効化可)。
-QUESTION_WORDS = {
+# ---------------------------------------------------------------------------
+# 機能語
+# ---------------------------------------------------------------------------
+# 疑問詞・人称・指示詞は、この作品で唯一「教えていないのに知っている」語。
+# ここに 1 箇所へ集めたうえで、lexicon.py が分布から自力で見つけ直せるように
+# してある。Config.bootstrap_function_words を false にすると種は空になり、
+# ナビは自分で発見するしかなくなる(tools/rediscover.py で観測できる)。
+SEED_QUESTION = {
     "何", "なに", "なん", "誰", "だれ", "どこ", "いつ", "どれ", "どの",
     "どちら", "どっち", "いくつ", "いくら", "なぜ", "どうして", "どう",
+    "なんで",
 }
+SEED_FIRST = {"ぼく", "僕", "私", "わたし", "わたくし", "俺", "おれ",
+              "オレ", "あたし", "自分", "うち"}
+SEED_SECOND = {"きみ", "君", "あなた", "あんた", "おまえ", "お前",
+               "そちら", "そっち"}
+SEED_DEICTIC = {
+    "これ", "それ", "あれ", "こいつ", "そいつ", "あいつ",
+    "ここ", "そこ", "あそこ", "こっち", "そっち", "あっち",
+    "こちら", "そちら", "あちら", "これら", "それら",
+}
+
+QUESTION_WORDS = SEED_QUESTION      # 後方互換
+
+
+@dataclass
+class FunctionWords:
+    """いま有効な機能語の集合。種か、自力で発見したものか、その両方。"""
+    questions: Set[str] = field(default_factory=set)
+    first: Set[str] = field(default_factory=set)
+    second: Set[str] = field(default_factory=set)
+    deictics: Set[str] = field(default_factory=set)
+
+    @classmethod
+    def seeded(cls) -> "FunctionWords":
+        return cls(set(SEED_QUESTION), set(SEED_FIRST),
+                   set(SEED_SECOND), set(SEED_DEICTIC))
+
+    @classmethod
+    def empty(cls) -> "FunctionWords":
+        return cls()
+
+    def merged(self, other: "FunctionWords") -> "FunctionWords":
+        return FunctionWords(self.questions | other.questions,
+                             self.first | other.first,
+                             self.second | other.second,
+                             self.deictics | other.deictics)
+
+    def counts(self) -> dict:
+        return {"questions": len(self.questions), "first": len(self.first),
+                "second": len(self.second), "deictics": len(self.deictics)}
+
+
+DEFAULT_FW = FunctionWords.seeded()
 
 
 @dataclass
@@ -58,9 +105,10 @@ class Arg:
     head: str            # 名詞句の主辞(複合名詞は連結済み)
     owner: str = ""      # 「AのB」の A
     case: str = ""       # が / を / に / … / は / も  (空 = 格標識なし)
+    q: bool = False      # 疑問詞かどうか(解析時に決まる)
 
     def is_question(self) -> bool:
-        return self.head in QUESTION_WORDS
+        return self.q
 
 
 @dataclass
@@ -72,6 +120,8 @@ class Pred:
     args: List[Arg] = field(default_factory=list)
     polarity: int = 1                 # +1 肯定 / -1 否定
     modality: Tuple[str, ...] = ()
+    span: Tuple[str, ...] = ()        # 述語+助動詞列の実際の表層(活用の記憶用)
+    connective: bool = False          # 接続助詞で終わっている(次の節に続く形)
     is_question: bool = False         # 述語位置が疑問詞、または項に疑問詞
     asking: bool = False              # 発話そのものが問いかけ(？ や 疑問詞を含む)
 
@@ -106,8 +156,13 @@ def _is_aux(t: Tok) -> bool:
 
 
 def _consume_aux(toks: Sequence[Tok], i: int, p: Pred) -> int:
-    """述語の後ろに続く助動詞列から極性とモダリティを読み取る。"""
+    """述語の後ろに続く助動詞列から極性とモダリティを読み取る。
+
+    同時に、実際に口にされた表層の並び(活用形)を span に記録する。
+    活用エンジンを持たない代わりに「聞いた活用だけを再現できる」ようにするため。
+    """
     mods: List[str] = []
+    span: List[str] = [p.surface] if p.surface else []
     while i < len(toks):
         t = toks[i]
         if not _is_aux(t):
@@ -115,9 +170,11 @@ def _consume_aux(toks: Sequence[Tok], i: int, p: Pred) -> int:
             # 述語の一部とみなして読み飛ばす(否定の取りこぼしを防ぐ)。
             if (t.pos == "助詞" and i + 1 < len(toks)
                     and toks[i + 1].pos == "助動詞"):
+                span.append(t.surface)
                 i += 1
                 continue
             break
+        span.append(t.surface)
         base = t.base or t.surface
         if base in NEGATIVE or t.surface in NEGATIVE:
             p.polarity = -p.polarity
@@ -125,16 +182,27 @@ def _consume_aux(toks: Sequence[Tok], i: int, p: Pred) -> int:
         if m and m not in mods:
             mods.append(m)
         i += 1
+    if span and i > 0 and toks[i - 1].pos == "助詞" and toks[i - 1].pos1 == "接続助詞":
+        p.connective = True
+    # 終助詞(よ/ね/な)は極性にもモダリティにも影響しないが、
+    # 語尾の雰囲気そのものなので span には含める。
+    # ただし次の節へ続く形には付けない(「だからね + 次の節」になるため)。
+    while (not p.connective and i < len(toks)
+           and toks[i].pos == "助詞" and toks[i].pos1 == "終助詞"):
+        span.append(toks[i].surface)
+        i += 1
     p.modality = tuple(mods)
+    p.span = tuple(span)
     return i
 
 
-def parse(toks: Sequence[Tok]) -> List[Pred]:
+def parse(toks: Sequence[Tok], fw: Optional[FunctionWords] = None) -> List[Pred]:
     """トークン列から述語項構造を抽出する。
 
     複文は「次に出てきた述語にそれまでの項を束ねる」という近似で処理する。
     取りこぼしも誤結合もあるが、統計を取る用途では十分に働く。
     """
+    fw = fw if fw is not None else DEFAULT_FW
     preds: List[Pred] = []
     pending: List[Arg] = []
     np_buf: List[str] = []
@@ -143,7 +211,8 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
     owner = ""
     i = 0
     n = len(toks)
-    asking = any(t.surface in "？?" for t in toks) or has_question_word(toks)
+    asking = (any(t.surface in "？?" for t in toks)
+              or any(t.surface in fw.questions for t in toks))
 
     def resolve_np() -> str:
         """名詞句の主辞を決める。形式名詞だけなら所有者に降りる。"""
@@ -156,7 +225,7 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
     def flush_np_as_arg(head: str, case: str = "") -> None:
         nonlocal np_buf, owner, np_last_pos1, np_independent
         if head:
-            pending.append(Arg(head, owner, case))
+            pending.append(Arg(head, owner, case, head in fw.questions))
         np_buf, owner, np_last_pos1, np_independent = [], "", "", False
 
     def flush_query() -> None:
@@ -216,8 +285,9 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
             p = make_pred(head, head, kind)
             if saved_owner:
                 p.args.append(Arg(head, saved_owner, ""))
-            if head in QUESTION_WORDS:
+            if head in fw.questions:
                 p.is_question = True
+            p.surface = head
             i = _consume_aux(toks, i, p)
             preds.append(p)
             continue
@@ -227,6 +297,7 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
                 is_terminator(t.surface) or t.pos == "助詞" and t.pos1 == "終助詞"):
             np_buf, np_last_pos1, owner, np_independent = [], "", "", False
             p = make_pred(head, head, "na")
+            p.span = (head,)
             preds.append(p)
             i += 1
             continue
@@ -261,7 +332,7 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
             p = make_pred(head, head, "copula")
             if saved_owner:
                 p.args.append(Arg(head, saved_owner, ""))
-            if head in QUESTION_WORDS:
+            if head in fw.questions:
                 p.is_question = True
             preds.append(p)
 
@@ -269,5 +340,7 @@ def parse(toks: Sequence[Tok]) -> List[Pred]:
     return preds
 
 
-def has_question_word(toks: Sequence[Tok]) -> bool:
-    return any(t.surface in QUESTION_WORDS for t in toks)
+def has_question_word(toks: Sequence[Tok],
+                      fw: Optional[FunctionWords] = None) -> bool:
+    fw = fw if fw is not None else DEFAULT_FW
+    return any(t.surface in fw.questions for t in toks)

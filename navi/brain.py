@@ -86,6 +86,7 @@ class NaviBrain:
         self.id2word: List[str] = []
         self.pos: List[str] = []
         self.pos1: List[str] = []
+        self.conj: List[str] = []
         self.capacity = max(cfg.initial_capacity, 64)
         self.state = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
         self.valence = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
@@ -140,13 +141,15 @@ class NaviBrain:
         self._content.extend(bytes(pad))
         self.capacity = new_cap
 
-    def _alloc(self, surface, pos, pos1, origin, va=100, vb=30, flags=0) -> int:
+    def _alloc(self, surface, pos, pos1, origin, va=100, vb=30, flags=0,
+               conj="") -> int:
         idx = len(self.id2word)
         self._grow(idx + 1)
         self.word2id[surface] = idx
         self.id2word.append(surface)
         self.pos.append(pos)
         self.pos1.append(pos1)
+        self.conj.append(conj)
         self.state[idx] = pack_state(va, vb, 0, origin, flags)
         self._content[idx] = 1 if (flags & FLAG_CONTENT) else 0
         return idx
@@ -168,11 +171,12 @@ class NaviBrain:
         flags = FLAG_CONTENT if is_content(tok) else 0
         # Web 由来の言葉は「聞きかじり」なので初期重要度を低く置く
         va = 100 if origin == ORIGIN_OPERATOR else 55
-        return self._alloc(tok.surface, tok.pos, tok.pos1, origin, va=va, flags=flags)
+        return self._alloc(tok.surface, tok.pos, tok.pos1, origin, va=va,
+                           flags=flags, conj=tok.conj)
 
     def tok_of(self, wid: int) -> Tok:
         s = self.id2word[wid]
-        return Tok(s, self.pos[wid], self.pos1[wid], s)
+        return Tok(s, self.pos[wid], self.pos1[wid], s, self.conj[wid])
 
     def is_content_id(self, wid: int) -> bool:
         return bool(self._content[wid])

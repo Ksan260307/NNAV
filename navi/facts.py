@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import ORIGIN_NAVI, ORIGIN_OPERATOR, ORIGIN_WEB
-from .parse import QUESTION_WORDS, Pred  # noqa: F401
+from .parse import FunctionWords, Pred
 
 ORIGIN_WEIGHT = {ORIGIN_OPERATOR: 1.0, ORIGIN_NAVI: 0.5, ORIGIN_WEB: 0.3}
 MAX_LEN = 24
@@ -53,14 +53,25 @@ class Fact:
         recency = 1.0 / (1.0 + max(0, now_turn - self.turn) / 60.0)
         return (1.0 + math.log1p(self.count)) * w * (0.30 + 0.70 * recency)
 
-    def text(self) -> str:
+    def text(self, deixis=None) -> str:
+        subj = deixis.display(self.subj) if deixis is not None else self.subj
+        obj = deixis.display(self.obj) if deixis is not None else self.obj
         rel = "" if self.rel == "=" else f"の{self.rel}"
         neg = "ではない" if self.polarity < 0 else ""
-        return f"{self.subj}{rel} = {self.obj}{neg}"
+        return f"{subj}{rel} = {obj}{neg}"
+
+
+_FW = FunctionWords.seeded()
 
 
 def _ok(s: str) -> bool:
-    return bool(s) and len(s) <= MAX_LEN and s not in QUESTION_WORDS
+    return bool(s) and len(s) <= MAX_LEN and s not in _FW.questions
+
+
+def set_function_words(fw: FunctionWords) -> None:
+    """発見された機能語を反映する(FactStore は文字列しか持たないため)。"""
+    global _FW
+    _FW = fw
 
 
 class FactStore:
@@ -169,7 +180,7 @@ class FactStore:
                 continue
             has_qword = any(a.is_question() for a in p.args)
             wants_value = (p.kind == "query" or p.is_question
-                           or p.lemma in QUESTION_WORDS)
+                           or p.lemma in _FW.questions)
 
             # 1) 「きみの名前は？」 主語も関係も明示されている
             if topic.owner and _ok(topic.owner):

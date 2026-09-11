@@ -20,10 +20,11 @@ except ImportError:  # pragma: no cover - 環境依存
 
 
 class Tok(NamedTuple):
-    surface: str   # 表層形
-    pos: str       # 品詞(大分類)
-    pos1: str      # 品詞細分類1
-    base: str      # 原形
+    surface: str        # 表層形
+    pos: str            # 品詞(大分類)
+    pos1: str           # 品詞細分類1
+    base: str           # 原形
+    conj: str = ""      # 活用形(命令形の検出・活用の記憶に使う)
 
 
 # --- 品詞カテゴリ ---------------------------------------------------------
@@ -88,7 +89,8 @@ class JPTokenizer:
             pos = parts[0] if parts else "その他"
             pos1 = parts[1] if len(parts) > 1 else "*"
             base = t.base_form if t.base_form and t.base_form != "*" else surface
-            out.append(Tok(surface, pos, pos1, base))
+            conj = getattr(t, "infl_form", "") or ""
+            out.append(Tok(surface, pos, pos1, base, conj))
         return out
 
 

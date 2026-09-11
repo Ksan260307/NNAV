@@ -42,6 +42,11 @@ class Comprehension:
         self.samples = 0
         self.cloze_samples = 0
         self.slot_samples = 0
+        # 外から差し込まれる軸(意図の当たり具合・指示詞の解決率)
+        self.intent_skill = 0.0
+        self.intent_ready = False
+        self.anaphora_rate = 0.0
+        self.anaphora_samples = 0
 
     # ------------------------------------------------------------------
     # 1トークンあたりの対数確率
@@ -154,29 +159,57 @@ class Comprehension:
         return out
 
     # ------------------------------------------------------------------
-    def understanding(self) -> float:
-        """0〜1 の総合スコア。成長段階のゲートに使う。"""
+    def core(self) -> float:
+        """常に測れる 3 軸だけの理解度。軸が増減しても比較できる基準線。"""
         if self.samples < 5:
             return 0.0
-        pred = _norm(self.logprob, -9.0, -1.5)
-        cloze = min(1.0, self.cloze * 3.0)     # MRR 0.33 で満点扱い
-        slot = self.slot
-        return 0.40 * pred + 0.30 * cloze + 0.30 * slot
+        return (0.30 * _norm(self.logprob, -9.0, -1.5)
+                + 0.20 * min(1.0, self.cloze * 3.0)
+                + 0.20 * self.slot) / 0.70
+
+    def understanding(self) -> float:
+        """0〜1 の総合スコア。成長段階のゲートに使う。
+
+        軸は 5 つあるが、まだ測れていない軸(意図・照応)は分母から外す。
+        「オペレーターが指示詞を使わないから育たない」が起きないようにするため。
+        """
+        if self.samples < 5:
+            return 0.0
+        axes = [
+            (0.30, _norm(self.logprob, -9.0, -1.5)),
+            (0.20, min(1.0, self.cloze * 3.0)),     # MRR 0.33 で満点扱い
+            (0.20, self.slot),
+        ]
+        if self.intent_ready:
+            axes.append((0.15, self.intent_skill))
+        if self.anaphora_samples >= 5:
+            axes.append((0.15, self.anaphora_rate))
+        total = sum(w for w, _ in axes)
+        return sum(w * v for w, v in axes) / total
 
     def detail(self) -> Dict[str, float]:
         return {
             "understanding": self.understanding(),
+            "core": self.core(),
             "logprob": self.logprob,
             "perplexity": math.exp(-self.logprob),
             "cloze_mrr": self.cloze,
             "slot_precision": self.slot,
+            "intent_skill": self.intent_skill,
+            "intent_ready": 1.0 if self.intent_ready else 0.0,
+            "anaphora_rate": self.anaphora_rate,
+            "anaphora_samples": self.anaphora_samples,
             "samples": self.samples,
         }
 
     def to_dict(self) -> dict:
         return {"logprob": self.logprob, "cloze": self.cloze, "slot": self.slot,
                 "samples": self.samples, "cloze_samples": self.cloze_samples,
-                "slot_samples": self.slot_samples}
+                "slot_samples": self.slot_samples,
+                "intent_skill": self.intent_skill,
+                "intent_ready": self.intent_ready,
+                "anaphora_rate": self.anaphora_rate,
+                "anaphora_samples": self.anaphora_samples}
 
     def load(self, d: dict) -> None:
         self.logprob = float(d.get("logprob", -9.0))
@@ -185,3 +218,7 @@ class Comprehension:
         self.samples = int(d.get("samples", 0))
         self.cloze_samples = int(d.get("cloze_samples", 0))
         self.slot_samples = int(d.get("slot_samples", 0))
+        self.intent_skill = float(d.get("intent_skill", 0.0))
+        self.intent_ready = bool(d.get("intent_ready", False))
+        self.anaphora_rate = float(d.get("anaphora_rate", 0.0))
+        self.anaphora_samples = int(d.get("anaphora_samples", 0))

@@ -10,13 +10,28 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .brain import NaviBrain
+def _jaccard(a, b) -> float:
+    a, b = set(a), set(b)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 from .comprehension import Comprehension
-from .config import FLAG_PINNED, ORIGIN_NAVI, ORIGIN_OPERATOR, Config
+from .config import FLAG_PINNED, ORIGIN_NAVI, ORIGIN_OPERATOR, ORIGIN_WEB, Config
+from .deixis import Deixis
+from .discourse import Discourse
 from .embed import Embedding
 from .emotion import Mood
 from .facts import Fact, FactStore
 from .frames import CaseFrames
-from .parse import parse
+from .intents import Intents
+from .lexicon import Lexicon
+from .neural import Neural
+from .parse import FunctionWords, parse
+from .realize import Realizer
+from .senses import Senses
+from . import facts as _facts_mod
 from .generate import SILENCE, Context, GenParams, fluency, generate, soliloquy
 from .growth import Growth, Stage
 from .store import Journal, load_snapshot, save_snapshot
@@ -54,6 +69,21 @@ class NetNavi:
         self.facts = FactStore()
         self.embed = Embedding(self.cfg.embed_dim)
         self.comp = Comprehension()
+        self.realizer = Realizer()
+        # 機能語(疑問詞・人称・指示詞)。種を切ると自力で見つけるしかなくなる。
+        self.lexicon = Lexicon()
+        self.seed_fw = (FunctionWords.seeded() if self.cfg.bootstrap_function_words
+                        else FunctionWords.empty())
+        self.fw = FunctionWords(*(set(x) for x in
+                                  (self.seed_fw.questions, self.seed_fw.first,
+                                   self.seed_fw.second, self.seed_fw.deictics)))
+        _facts_mod.set_function_words(self.fw)
+        self.deixis = Deixis(self.cfg.use_person_words, self.fw)
+        self.discourse = Discourse(self.cfg.use_demonstratives, self.fw)
+        self.intents = Intents(self.cfg.intent_k)
+        self.senses = Senses(self.cfg.senses_enabled)
+        self.neural = Neural(self.cfg.neural_dim, self.cfg.neural_hidden)
+        self.last_intent = -1
         if self.cfg.semantics_enabled:
             self.brain.embed = self.embed
         self.web = WebLearner(self.cfg, self.brain, self.mood,
@@ -71,6 +101,15 @@ class NetNavi:
         self._last_facts: List[Fact] = []
         self._last_clashes: List[tuple] = []
         self._last_embed_turn = 0
+        self._last_env = None
+        self._last_anaphora = 0
+        # 直前のやりとり(返し方の評価に使う)
+        # (入力意図, 返答意図, 返答の内容語, 入力テキスト, 入力の内容語)
+        self._pending: Optional[tuple] = None
+        self.novelty = 0.0               # 新規発話率(記憶の再生でない発話の割合)
+        self.replies = 0
+        self.debug_pool = False          # True にすると候補一式を last_pool に残す
+        self.last_pool: List = []
         self.pending: List[str] = []          # 自発発話のキュー
         self.session_started = time.time()
         self.dream_count = 0
@@ -97,6 +136,18 @@ class NetNavi:
             self.facts.load(extra.get("facts", {}) or {})
             self.embed.load(extra.get("embed", {}) or {})
             self.comp.load(extra.get("comprehension", {}) or {})
+            self.realizer.load(extra.get("realizer", {}) or {})
+            self.deixis.load(extra.get("deixis", {}) or {})
+            self.discourse.load(extra.get("discourse", {}) or {})
+            self.intents.load(extra.get("intents", {}) or {})
+            self.senses.load(extra.get("senses", {}) or {})
+            self.neural.load(extra.get("neural", {}) or {})
+            self.lexicon.load(extra.get("lexicon", {}) or {})
+            self.refresh_function_words()
+            self.last_intent = int(extra.get("last_intent", -1))
+            self.novelty = float(extra.get("novelty", 0.0))
+            self.replies = int(extra.get("replies", 0))
+            self.growth.novelty = self.novelty
             self._last_embed_turn = int(extra.get("last_embed_turn", 0))
 
         def apply(rec: Dict[str, Any]) -> None:
@@ -115,26 +166,113 @@ class NetNavi:
     # ------------------------------------------------------------------
     # 出来事の適用(ライブ実行と WAL 再生で同じ経路を通す)
     # ------------------------------------------------------------------
+    def _grade_last_reply(self, text: str, keys) -> Optional[float]:
+        """前回の返し方を、オペレーターの反応から採点する。
+
+        独話の意図遷移を学んでも「問いかけにどう返すべきか」は出てこない。
+        本当の教師信号は、返した **後** にオペレーターが取る行動のほう。
+        """
+        p = self._pending
+        self._pending = None
+        if not p:
+            return None
+        in_i, reply_i, reply_keys, in_text, in_keys = p
+        if in_i < 0 or reply_i < 0:
+            return None
+        now = set(keys)
+        # 1) さっきの問いかけを言い直した = 答えになっていなかった
+        if in_text and (text.strip() == in_text.strip() or _jaccard(now, in_keys) > 0.7):
+            r = -1.0
+        # 2) こちらが出した語を拾って続けた = 会話が転がった
+        elif reply_keys and (now & set(reply_keys)):
+            r = 1.0
+        # 3) 話題がまるごと切り替わった
+        else:
+            r = -0.3
+        self.intents.observe_reward(in_i, reply_i, r)
+        return r
+
+    def _env(self):
+        return self.senses.env_now(self.mood.last_input_at)
+
+    def _interpret(self, text: str, speaker: int) -> List:
+        """文を述語項構造にし、人称を役割に畳み、指示詞を解決する。
+
+        学習と発話生成の両方がここを通るので、解釈は必ず一致する。
+        """
+        if not self.cfg.semantics_enabled:
+            return []
+        toks = self.brain.tok.tokenize(text)
+        preds = parse(toks, self.fw)
+        asking = (any(ch in "？?" for ch in text)
+                  or any(t.surface in self.fw.questions for t in toks))
+        if self.cfg.discover_function_words:
+            # 人称の観測は畳む前、穴の観測は畳んだ後(事実ストアと鍵を揃える)
+            self.lexicon.observe(toks, preds, asking)
+        self.deixis.apply(preds, speaker)
+        if self.cfg.discover_function_words:
+            self.lexicon.observe_slots(preds, asking)
+        if preds:
+            n = self.discourse.resolve(preds, self.frames, self.embed,
+                                       self.brain, self.brain.turns)
+            if n:
+                self._last_anaphora += n
+        return preds
+
     def _apply(self, rec: Dict[str, Any]) -> None:
         op = rec.get("op")
         b = self.brain
         if op == "learn":
             text, w, origin = rec["x"], rec["w"], rec["o"]
-            preds = parse(b.tok.tokenize(text)) if self.cfg.semantics_enabled else []
+            self._last_anaphora = 0
+            preds = self._interpret(text, origin)
 
             # --- prequential 評価: 学習する前に予測させて当たり具合を測る ---
             if self.cfg.semantics_enabled and origin == ORIGIN_OPERATOR:
                 pre_ids, _ = b.encode(text)
                 self.comp.observe(b, self.frames, pre_ids, preds)
+                if self.cfg.neural_enabled:
+                    self.neural.observe(pre_ids)
 
             self._last_learn = b.learn_text(text, w, origin, bool(rec.get("p", False)))
+            ids = self._last_learn[0]
 
             if self.cfg.semantics_enabled:
                 self.frames.observe(preds, w)
+                self.frames.observe_surface(b.tok.tokenize(text), w)
+                self.realizer.observe(preds, w)
                 learned, clashes = self.facts.observe(preds, origin, b.turns)
+                for f in learned:
+                    self.lexicon.note_fact(f.subj, f.rel, f.obj)
+                if learned:
+                    self.deixis.learn_names(self.facts)
+                self.discourse.observe(preds, b.turns)
                 self._last_preds = preds
                 self._last_facts = learned
                 self._last_clashes = clashes
+                # 照応の解決率(理解度の 1 軸)
+                if self.discourse.attempted:
+                    self.comp.anaphora_rate = self.discourse.rate()
+                    self.comp.anaphora_samples = self.discourse.attempted
+
+            if origin in (ORIGIN_OPERATOR, ORIGIN_WEB) and self.cfg.neural_enabled:
+                self.neural.corpus.add(ids)
+
+            if origin == ORIGIN_OPERATOR:
+                if self.cfg.senses_enabled:
+                    env = self._env()
+                    self.senses.observe(ids, env, w)
+                if self.cfg.intents_enabled and ids:
+                    vec = self.intents.featurize(b, ids, preds)
+                    cur = self.intents.classify(vec) if self.intents.ready() else -1
+                    if cur >= 0:
+                        if self.last_intent >= 0:
+                            self.intents.evaluate(self.last_intent, cur)
+                            self.intents.observe_pair(self.last_intent, cur)
+                        self.last_intent = cur
+                    self.intents.add_sample(vec, text)
+                    self.comp.intent_ready = self.intents.measurable()
+                    self.comp.intent_skill = self.intents.appropriateness()
         elif op == "assoc":
             b.associate(rec["a"], rec["b"], rec["w"])
         elif op == "link":
@@ -153,6 +291,9 @@ class NetNavi:
                 b.decay()
                 if self.cfg.semantics_enabled:
                     self.frames.decay(self.cfg.synapse_decay, self.cfg.synapse_prune)
+                    self.realizer.decay(self.cfg.synapse_decay, self.cfg.synapse_prune)
+                if self.cfg.senses_enabled:
+                    self.senses.decay(self.cfg.synapse_decay)
 
     def _do(self, op: str, **fields: Any) -> None:
         """出来事を記録してから適用する。"""
@@ -175,6 +316,11 @@ class NetNavi:
             return Reply(SILENCE, SILENCE)
         with self.lock:
             before_vocab = self.brain.vocab_size
+
+            if learn and self.cfg.intents_enabled:
+                # 0. 前回の返し方を、いまの反応から採点する
+                _, pre_keys = self.brain.encode(text)
+                self._grade_last_reply(text, pre_keys)
 
             if learn:
                 # 1. オペレーターの言葉を学ぶ(最優先・最大の重み)
@@ -201,22 +347,46 @@ class NetNavi:
 
             # 4. 考えてから喋る
             self.growth.understanding = self.comp.understanding()
+            self.growth.novelty = self.novelty
             stage = self.growth.stage(self.brain.learned_vocab, self.brain.turns)
             params = self._params(stage)
+            in_preds = (self._last_preds if learn
+                        else self._interpret(text, ORIGIN_OPERATOR))
+            sem = self.cfg.semantics_enabled
+            ground = None
+            if self.cfg.senses_enabled and params.ground_weight > 0:
+                g = self.senses.score_all(self._env(), self.brain.vocab_size)
+                ground = g.tolist() if g is not None else None
+            intent_in = -1
+            if self.cfg.intents_enabled and self.intents.ready() and ids:
+                intent_in = self.intents.classify(
+                    self.intents.featurize(self.brain, ids, in_preds))
             ctx = Context(
                 input_ids=ids, input_keys=keys, input_text=text,
                 recent_texts=list(self.recent_replies),
                 topic_ids=[t for t, _ in self.brain.related(keys, topn=8)],
                 energy=self.mood.energy, valence=self.mood.valence,
                 asking=any(ch in "？?" for ch in text),
-                input_preds=(parse(self.brain.tok.tokenize(text))
-                             if self.cfg.semantics_enabled else []),
-                frames=self.frames if self.cfg.semantics_enabled else None,
-                embed=self.embed if self.cfg.semantics_enabled else None,
-                facts=self.facts if self.cfg.semantics_enabled else None,
+                input_preds=in_preds,
+                input_surfaces={a.head for p_ in in_preds for a in p_.args if a.head},
+                fw=self.fw,
+                frames=self.frames if sem else None,
+                embed=self.embed if sem else None,
+                facts=self.facts if sem else None,
+                realizer=self.realizer if sem else None,
+                deixis=self.deixis if sem else None,
+                intents=self.intents if self.cfg.intents_enabled else None,
+                intent_in=intent_in,
+                ground=ground,
                 turn=self.brain.turns,
             )
-            cand = generate(self.brain, ctx, params, self.rng)
+            pool = [] if self.debug_pool else None
+            cand = generate(self.brain, ctx, params, self.rng,
+                            neural=self.neural if self.cfg.neural_enabled else None,
+                            pool_out=pool)
+            if pool is not None:
+                pool.sort(key=lambda c: -c.score)
+                self.last_pool = pool
 
             if not learn:
                 return Reply(cand.text, cand.annotated, cand.strategy, cand.score,
@@ -228,6 +398,16 @@ class NetNavi:
                 self._do("coh", f=fluency(self.brain, cand.ids))
             self._do("turn")
 
+            if self.cfg.intents_enabled and intent_in >= 0:
+                self._pending = (intent_in, int(cand.detail.get("intent", -1)),
+                                 [i for i in cand.ids if self.brain.is_content_id(i)],
+                                 text, list(keys))
+            if cand.ids:
+                fresh_ = 1.0 if cand.detail.get("new", 0.0) > 0 else 0.0
+                self.replies += 1
+                a = 0.05 if self.replies > 20 else 1.0 / self.replies
+                self.novelty = (1 - a) * self.novelty + a * fresh_
+                self.growth.novelty = self.novelty
             self.last_reply_ids = list(cand.ids)
             self.last_reply_text = cand.text
             self.recent_replies.append(cand.text)
@@ -237,6 +417,9 @@ class NetNavi:
 
             stage_up = self.growth.observe(self.brain.learned_vocab, self.brain.turns)
             self._maybe_build_embedding()
+            if (self.cfg.intents_enabled and not self.intents.ready()
+                    and self.brain.turns % 50 == 0):
+                self.intents.fit(self.rng)
             self._maybe_compact()
             return Reply(cand.text, cand.annotated, cand.strategy, cand.score,
                          cand.is_question, stage_up, new_words, len(cand.ids),
@@ -252,8 +435,18 @@ class NetNavi:
             p.frame_weight = self.cfg.frame_weight
             p.semantic_weight = self.cfg.semantic_weight
             p.fact_bias = self.cfg.fact_answer_bias
+            p.plan_bias = self.cfg.plan_bias
+            p.plan_candidates = self.cfg.plan_candidates
         else:
             p.frame_weight = p.semantic_weight = 0.0
+            p.allow_plan = False
+        if self.cfg.senses_enabled:
+            p.ground_weight = self.cfg.ground_weight
+        if self.cfg.intents_enabled:
+            p.intent_weight = self.cfg.intent_weight
+        if self.cfg.neural_enabled:
+            # 学習前の発話をどちらがよく言い当てたかで、採点の主導権が移る
+            p.nn_weight = self.neural.alpha(self.comp.logprob)
         return p
 
     # ------------------------------------------------------------------
@@ -280,6 +473,12 @@ class NetNavi:
             delta = self.cfg.w_feedback * (1.0 if positive else -1.0)
             self._do("fb", i=self.last_reply_ids, d=delta)
             self._do("val", i=self.last_reply_ids, d=0.35 if positive else -0.35)
+            if self.cfg.intents_enabled and self._pending:
+                in_i, reply_i = self._pending[0], self._pending[1]
+                if in_i >= 0 and reply_i >= 0:
+                    self.intents.observe_reward(in_i, reply_i,
+                                                2.0 if positive else -2.0)
+                self._pending = None
             self.mood.on_feedback(positive)
             if positive and self.last_reply_text:
                 # 褒められた発話は「自分の言葉」として記憶に残す
@@ -310,8 +509,10 @@ class NetNavi:
             stage = self.growth.stage(self.brain.learned_vocab, self.brain.turns)
             if stage.level < 1:
                 return None
-            # 眠っている間に意味空間を編成し直す
+            # 眠っている間に意味空間・意図クラスタを編成し直す
             self._maybe_build_embedding()
+            if self.cfg.intents_enabled and not self.intents.ready():
+                self.intents.fit(self.rng)
             cand = soliloquy(self.brain, self._params(stage), self.rng)
             if not cand or not cand.ids or len(cand.ids) < 2:
                 return None
@@ -319,6 +520,50 @@ class NetNavi:
             self._do("fb", i=cand.ids, d=self.cfg.w_dream)
             self.dream_count += 1
             return cand.text
+
+    def deep_sleep(self) -> Dict[str, Any]:
+        """深い睡眠。意味空間・意図クラスタを貼り直し、ニューラルを学習する。
+
+        重い処理はすべてここに集めてある。会話中は一切走らない。
+        """
+        out: Dict[str, Any] = {}
+        with self.lock:
+            # 脳を読む処理だけロックの内側で済ませる
+            if self._maybe_build_embedding(force=True):
+                out["embed"] = self.embed.builds
+            if self.cfg.intents_enabled and self.intents.fit(self.rng):
+                out["intents"] = self.intents.k
+            found = self.refresh_function_words()
+            if found:
+                out["lexicon"] = found
+            build = self.cfg.neural_enabled and self.neural.ensure(self.brain,
+                                                                   self.embed)
+        # 学習はロックの外。ここを握ったままだと、眠っている間に
+        # 話しかけられたオペレーターが数十秒待たされる。
+        if self.cfg.neural_enabled and self.neural.ready():
+            r = self.neural.train(self.cfg.neural_train_sec, rng=self.rng)
+            if r.get("steps"):
+                out["neural"] = r
+            elif build:
+                out["neural"] = {"steps": 0, "loss": 0.0, "sec": 0.0}
+        return out
+
+    def refresh_function_words(self) -> Dict[str, int]:
+        """分布から見つけた機能語を、種に足して有効化する。"""
+        if not self.cfg.discover_function_words:
+            return {}
+        found = self.lexicon.discovered(self.frames, self.embed, self.brain)
+        merged = self.seed_fw.merged(found)
+        added = {
+            "questions": len(merged.questions - self.fw.questions),
+            "first": len(merged.first - self.fw.first),
+            "second": len(merged.second - self.fw.second),
+            "deictics": len(merged.deictics - self.fw.deictics),
+        }
+        self.fw.questions, self.fw.first = merged.questions, merged.first
+        self.fw.second, self.fw.deictics = merged.second, merged.deictics
+        _facts_mod.set_function_words(self.fw)
+        return {k: v for k, v in added.items() if v}
 
     def study(self, topic: Optional[str] = None) -> StudyResult:
         """インターネットで調べ物をする。
@@ -408,6 +653,15 @@ class NetNavi:
                 "facts": self.facts.to_dict(),
                 "embed": self.embed.to_dict(),
                 "comprehension": self.comp.to_dict(),
+                "realizer": self.realizer.to_dict(),
+                "deixis": self.deixis.to_dict(),
+                "discourse": self.discourse.to_dict(),
+                "intents": self.intents.to_dict(),
+                "senses": self.senses.to_dict(),
+                "neural": self.neural.to_dict(),
+                "lexicon": self.lexicon.to_dict(),
+                "last_intent": self.last_intent,
+                "novelty": self.novelty, "replies": self.replies,
                 "last_embed_turn": self._last_embed_turn,
                 "saved_at": time.time()}
 
@@ -441,6 +695,7 @@ class NetNavi:
             vocab = self.brain.learned_vocab
             turns = self.brain.turns
             self.growth.understanding = self.comp.understanding()
+            self.growth.novelty = self.novelty
             cur, nxt, ratio = self.growth.progress(vocab, turns)
             st = self.brain.stats()
             return {
@@ -450,12 +705,22 @@ class NetNavi:
                 "assoc": st["assoc_rows"],
                 "tokens": st["tokens"], "web_tokens": st["web_tokens"],
                 "coherence": self.growth.coherence_ema,
+                "novelty": self.novelty,
                 "comprehension": self.comp.detail(),
                 "frames": self.frames.stats(),
                 "facts": self.facts.stats(),
                 "embed_ready": self.embed.ready(),
                 "embed_builds": self.embed.builds,
                 "conflicts": self.facts.conflicts[-3:],
+                "realizer": self.realizer.stats(),
+                "discourse": self.discourse.stats(),
+                "intents": self.intents.stats(),
+                "senses": self.senses.stats(),
+                "neural": self.neural.stats(),
+                "alpha": self.neural.alpha(self.comp.logprob),
+                "deixis": {"names": dict(self.deixis.names)},
+                "lexicon": self.lexicon.stats(),
+                "function_words": self.fw.counts(),
                 "mood": self.mood, "mood_label": self.mood.label(),
                 "origins": self.brain.origin_counts(),
                 "top_words": self.brain.top_words(10),

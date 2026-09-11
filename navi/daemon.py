@@ -30,6 +30,8 @@ class NaviDaemon(threading.Thread):
         self.last_speak = 0.0
         self.dreams: List[str] = []
         self.studies: List[str] = []
+        self.sleeps: List[str] = []
+        self.last_deep = 0.0
 
     def stop(self) -> None:
         self._stopev.set()
@@ -54,6 +56,26 @@ class NaviDaemon(threading.Thread):
             if text:
                 self.dreams.append(text)
                 del self.dreams[:-30]
+
+        # --- 深い睡眠(重い学習はすべてここ) --------------------------------
+        if (idle >= self.cfg.neural_idle_sec
+                and now - self.last_deep >= self.cfg.neural_idle_sec):
+            self.last_deep = now
+            r = self.navi.deep_sleep()
+            if r:
+                parts = []
+                if "embed" in r:
+                    parts.append("意味空間を編成し直した")
+                if "intents" in r:
+                    parts.append(f"意図を{r['intents']}種類に整理した")
+                if "neural" in r:
+                    parts.append(f"神経回路を{r['neural']['steps']}歩ぶん鍛えた "
+                                 f"(loss {r['neural']['loss']:.3f})")
+                if parts:
+                    msg = " / ".join(parts)
+                    self.sleeps.append(msg)
+                    del self.sleeps[:-20]
+                    self.on_event("[睡眠] " + msg)
 
         # --- 自律的な調べ物 ----------------------------------------------
         if self.cfg.web_enabled and self.navi.web.due():
@@ -91,4 +113,6 @@ class NaviDaemon(threading.Thread):
             out.append("[夢] " + " / ".join(self.dreams[-3:]))
         if self.studies:
             out.append("[調べ物] " + " / ".join(self.studies[-3:]))
+        if self.sleeps:
+            out.append("[睡眠] " + " / ".join(self.sleeps[-2:]))
         return out
