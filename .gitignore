@@ -1,0 +1,7 @@
+navi_data*/
+__pycache__/
+*.pyc
+*.pt
+navi_vocab.json
+navi_tensors.pt
+.venv/
